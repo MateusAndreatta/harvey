@@ -413,6 +413,14 @@ MIGRATIONS: list[str] = [
     -- so one subscription's budget never consumes the other's.
     ALTER TABLE usage_log ADD COLUMN codex_calls INTEGER DEFAULT 0;
     """,
+    # ── v12: lead-list fields (address, city, published email, ICP score) ──
+    """
+    ALTER TABLE companies ADD COLUMN address TEXT DEFAULT '';
+    ALTER TABLE companies ADD COLUMN city TEXT DEFAULT '';
+    ALTER TABLE companies ADD COLUMN public_email TEXT DEFAULT '';
+    ALTER TABLE companies ADD COLUMN icp_score INTEGER DEFAULT 0;
+    ALTER TABLE companies ADD COLUMN icp_reason TEXT DEFAULT '';
+    """,
 ]
 
 BRAIN_PROVIDERS = ("claude", "codex")
@@ -489,6 +497,8 @@ class StateManager:
             except (json.JSONDecodeError, TypeError):
                 parsed = []
             d[field] = parsed if isinstance(parsed, list) else []
+        if d.get("icp_score") is None:
+            d["icp_score"] = 0
         return Company(**d)
 
     async def add_company(self, company: Company) -> str:
@@ -506,14 +516,17 @@ class StateManager:
             cursor = await db.execute(
                 """INSERT OR IGNORE INTO companies
                    (id, name, domain, website, description, industry,
-                    company_size, location, phone, source, source_url,
+                    company_size, location, phone, address, city, public_email,
+                    icp_score, icp_reason, source, source_url,
                     external_id, notes, tech_stack_json, signals_json,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     company.id, company.name, company.domain, company.website,
                     company.description, company.industry, company.company_size,
-                    company.location, company.phone, company.source,
+                    company.location, company.phone, company.address, company.city,
+                    company.public_email, int(company.icp_score or 0),
+                    company.icp_reason, company.source,
                     company.source_url, company.external_id, company.notes,
                     json.dumps(company.tech_stack), json.dumps(company.signals),
                     company.created_at.isoformat(),
@@ -604,6 +617,35 @@ class StateManager:
             ) as cursor:
                 row = await cursor.fetchone()
                 return self._company_from_row(row) if row else None
+
+    _LEAD_COLUMNS = frozenset({
+        "address", "city", "phone", "website", "public_email",
+        "icp_score", "icp_reason", "industry",
+    })
+
+    async def update_company_lead(self, company_id: str, **fields):
+        """Update lead-list columns. Unknown keys are ignored."""
+        fields = {k: v for k, v in fields.items() if k in self._LEAD_COLUMNS}
+        if not fields or not company_id:
+            return
+        if "icp_score" in fields:
+            fields["icp_score"] = int(fields["icp_score"] or 0)
+        sets = ", ".join(f"{k} = ?" for k in fields)
+        async with self._connect() as db:
+            await db.execute(
+                f"UPDATE companies SET {sets}, updated_at = CURRENT_TIMESTAMP "
+                f"WHERE id = ?",
+                (*fields.values(), company_id),
+            )
+            await db.commit()
+
+    async def list_companies(self) -> list[Company]:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM companies ORDER BY name"
+            ) as cursor:
+                return [self._company_from_row(r) for r in await cursor.fetchall()]
 
     async def get_company_by_external_id(self, external_id: str) -> Company | None:
         """Look a company up by its provider-stable id.
@@ -717,6 +759,32 @@ class StateManager:
             ) as cursor:
                 rows = await cursor.fetchall()
                 return [self._prospect_from_row(r) for r in rows]
+
+    async def list_prospects(self) -> list[Prospect]:
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM prospects") as cursor:
+                return [self._prospect_from_row(r) for r in await cursor.fetchall()]
+
+    async def update_prospect_score(
+        self, prospect_id: str, score: int, notes: str = ""
+    ):
+        async with self._connect() as db:
+            if notes:
+                await db.execute(
+                    """UPDATE prospects
+                       SET score = ?, personalization_notes = ?,
+                           updated_at = CURRENT_TIMESTAMP
+                       WHERE id = ?""",
+                    (int(score), notes, prospect_id),
+                )
+            else:
+                await db.execute(
+                    """UPDATE prospects SET score = ?,
+                       updated_at = CURRENT_TIMESTAMP WHERE id = ?""",
+                    (int(score), prospect_id),
+                )
+            await db.commit()
 
     async def update_prospect_status(self, prospect_id: str, status: str):
         async with self._connect() as db:

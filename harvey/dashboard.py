@@ -129,18 +129,30 @@ async def get_setup_status():
         "help": "Run: python3 -m venv .venv && source .venv/bin/activate && pip install -e .",
     })
 
+    # Lead-list installs set email off (or provider none). They do not need
+    # a mailbox, a verifier, or a .env file to discover, profile, score, export.
+    email_cfg = {}
+    try:
+        with open(_resolve_config_file()) as f:
+            loaded = yaml.safe_load(f) or {}
+        email_cfg = ((loaded.get("channels") or {}).get("email") or {})
+    except Exception:
+        email_cfg = {}
+    provider = str(email_cfg.get("provider") or "instantly").strip().lower()
+    list_only = email_cfg.get("enabled", True) is False or provider in ("", "none", "off")
+
     # 2. Env file
     env_vars = _read_env_file()
     env_exists = ENV_FILE.exists() and bool(env_vars)
     checks.append({
         "id": "env_file", "label": "Environment file (.env)",
         "done": env_exists,
-        "required": True,
-        "help": "Go to the Settings tab to enter your API keys.",
+        "required": not list_only,
+        "help": "Go to the Settings tab to enter your API keys." if not list_only
+                else "Optional while email sending is off. Discovery does not need a mailbox.",
     })
 
     # 3. Email provider configured (matches channels.email.provider)
-    provider = _current_provider()
 
     def _has(*keys):
         return all((env_vars.get(k, "") or os.getenv(k, "")).strip() for k in keys)
@@ -162,21 +174,34 @@ async def get_setup_status():
         instantly_key = env_vars.get("INSTANTLY_API_KEY", "") or os.getenv("INSTANTLY_API_KEY", "")
         provider_done = bool(instantly_key) and instantly_key != "your_instantly_api_key_here"
         provider_help = "Enter your Instantly API key in Settings."
-    checks.append({
-        "id": "email_provider", "label": f"Email provider configured ({provider})",
-        "done": provider_done,
-        "required": True,
-        "help": provider_help,
-    })
+    if list_only:
+        checks.append({
+            "id": "email_provider",
+            "label": "Email sending off — lead lists only",
+            "done": True,
+            "required": False,
+            "help": "Discovery, profiling, scoring, and export do not need Gmail "
+                    "or SMTP. Turn channels.email back on when you want to send.",
+        })
+    else:
+        checks.append({
+            "id": "email_provider", "label": f"Email provider configured ({provider})",
+            "done": provider_done,
+            "required": True,
+            "help": provider_help,
+        })
 
     # 4. Email verification (needed for addresses to be sendable, not 'guess')
     verifier_set = _has("REOON_API_KEY") or _has("ZEROBOUNCE_API_KEY") or _has("HUNTER_API_KEY")
     checks.append({
         "id": "verifier", "label": "Email verification key",
         "done": verifier_set,
-        "required": True,
+        "required": not list_only,
         "help": "Add a Reoon (free 600/mo), ZeroBounce, or Hunter key in Settings — "
-                "without one, found emails stay 'guess' and are never sent.",
+                "without one, found emails stay 'guess' and are never sent."
+                if not list_only else
+                "Optional for a lead list. A published inbox is labeled "
+                "'published' and does not need a verifier.",
     })
 
     # 5. Config valid
@@ -788,6 +813,32 @@ async def export_prospects(all: bool = False, min_score: int = 0, email_status: 
     )
 
 
+@app.get("/api/export/leads.csv")
+async def export_leads(min_score: int = 0):
+    """Lead-list CSV: one row per company, no mailbox required."""
+    from harvey.config import load_config
+    from harvey.state import StateManager
+    from harvey.export import export_leads_csv
+
+    state = StateManager(db_path=str(DB_PATH))
+    config = None
+    try:
+        config = load_config()
+    except Exception:
+        config = None
+    try:
+        await state.init_db()
+        _, text = await export_leads_csv(state, config=config, min_score=min_score)
+    except Exception as e:
+        logger.warning("Lead export failed: %s", e)
+        text = ""
+    return PlainTextResponse(
+        text,
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="leads.csv"'},
+    )
+
+
 @app.get("/api/campaigns")
 async def get_campaigns():
     rows = await query_db("SELECT * FROM campaigns ORDER BY created_at DESC LIMIT 100")
@@ -1168,7 +1219,9 @@ CATEGORY_ORDER = ["discovery", "profile", "people", "verification"]
 async def get_signals():
     """The signal vocabulary, grouped for review, with live cohort sizes."""
     try:
-        from harvey.signals import seed_signal_catalog
+        from harvey.signals import (
+            active_language, localize_category, localize_signal, seed_signal_catalog,
+        )
 
         state = _state()
         await state.init_db()
@@ -1177,7 +1230,8 @@ async def get_signals():
         # upgrade show up as `proposed` without any migration step.
         await seed_signal_catalog(state)
 
-        codes = await state.get_signal_codes()
+        language = active_language()
+        codes = [localize_signal(s, language) for s in await state.get_signal_codes()]
         counts = {c["signal_code"]: c for c in await state.signal_counts()}
 
         groups, summary = [], {"proposed": 0, "confirmed": 0, "rejected": 0}
@@ -1194,10 +1248,13 @@ async def get_signals():
                 })
             if rows:
                 meta = CATEGORY_META.get(cat, {})
+                label, blurb = localize_category(
+                    cat, language, meta.get("label", cat.title()), meta.get("blurb", ""),
+                )
                 groups.append({
                     "key": cat,
-                    "label": meta.get("label", cat.title()),
-                    "blurb": meta.get("blurb", ""),
+                    "label": label,
+                    "blurb": blurb,
                     "signals": rows,
                 })
         for sig in codes:

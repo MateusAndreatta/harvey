@@ -1,0 +1,84 @@
+# Example for a lead list in Brazil. Copy to harvey.local.yaml (gitignored)
+# and replace the placeholders. Nothing here is a real company.
+#
+# Email sending is off on purpose: discover, profile, scout, and
+# `harvey export` do not need Gmail, SMTP, or any key in .env.
+# OpenStreetMap is free. Pure online stores are thin there — it maps
+# premises, and e-commerce falls back to wholesale shops.
+
+language: pt-BR
+
+persona:
+  name: "Seu Nome"
+  company: "Sua Empresa"
+  role: "Comercial"
+  email: "voce@suaempresa.com.br"
+  linkedin: ""
+  tone: "direto, profissional, sem jargão"
+
+product:
+  name: "Etiquetas e rótulos"
+  description: "Etiquetas e rótulos para quem produz e vende produto físico."
+  pricing: "Sob consulta"
+  key_benefits:
+    - "Rótulo certo para o produto e para o prazo"
+    - "Atende do pequeno lote ao pedido recorrente"
+    - "Fala com quem compra, não com um departamento genérico"
+  objection_responses: {}
+  offer:
+    primary: "Fornecimento de etiquetas e rótulos"
+    entry: "Orçamento sem compromisso"
+    goal: "get_reply"
+    booking_method: "ask_preference"
+    meeting_duration: "15 minutes"
+    meeting_owner: "Seu Nome"
+
+icp:
+  industries:
+    - "Cervejarias"
+    - "Vinícolas"
+    - "Destilarias"
+    - "Alimentos"
+    - "Padarias"
+    - "Confeitarias"
+    - "Cosméticos"
+    - "Confecções"
+    - "Farmácias de manipulação"
+    - "Indústria"
+    - "E-commerce"
+  company_size: "pequeno e médio"
+  titles:
+    - "Proprietário"
+    - "Sócio"
+    - "Comprador"
+    - "Gerente de compras"
+  geography:
+    - "Curitiba, PR"
+    - "São Paulo, SP"
+  # Keys must match geography exactly. lat,lng,radius_km.
+  geo_coordinates:
+    "Curitiba, PR": "-25.4284,-49.2733,40"
+    "São Paulo, SP": "-23.5505,-46.6333,40"
+  hiring_signals: []
+
+channels:
+  email:
+    enabled: false
+    provider: "none"
+    max_daily_sends: 0
+    require_approval: true
+  linkedin:
+    enabled: false
+
+usage:
+  max_daily_claude_percent: 80
+  heartbeat_interval_minutes: 15
+  quiet_hours:
+    start: "22:00"
+    end: "07:00"
+    timezone: "America/Sao_Paulo"
+
+compliance:
+  regime: br
+  precleared:
+    enabled: false

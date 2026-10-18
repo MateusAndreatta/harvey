@@ -20,6 +20,14 @@ class Company(BaseModel):
     company_size: str = ""
     location: str = ""
     phone: str = ""
+    # Street address and city, kept apart so a lead list can show both.
+    address: str = ""
+    city: str = ""
+    # Inbox published on the site (contato@), distinct from a person's email.
+    public_email: str = ""
+    # Deterministic ICP fit filled by scout. 0 means not scored yet.
+    icp_score: int = 0
+    icp_reason: str = ""
     source: str = ""          # how we found them: google_dork, linkedin, company_scrape
     source_url: str = ""      # specific URL where we found the info
     # Provider-stable identity ("dataforseo:ChIJ...", "osm:node/123"). The

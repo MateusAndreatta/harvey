@@ -30,6 +30,7 @@ from urllib.parse import urlparse
 import httpx
 
 from harvey.models import Company
+from harvey.textutil import fold
 
 logger = logging.getLogger("harvey.collectors.discover")
 
@@ -61,6 +62,8 @@ JUNK_DOMAIN_PATTERNS = tuple(re.compile(p, re.I) for p in (
     r"(hospital|healthsystem|medicalcenter)\.",
     r"health\.org$",
     # infrastructure that is never a prospect
+    r"(^|\.)(apontador|telelistas|guiamais|solutudo|hagah|kekanto)\.",
+    r"(^|\.)(cnpj|econodata|casadosdados)\.",
     r"(^|\.)(google|bing|yahoo|duckduckgo|amazon|apple|microsoft)\.",
     r"(wordpress|wix|squarespace|shopify|godaddy|weebly|webflow)\.com$",
 ))
@@ -486,17 +489,88 @@ class OpenStreetMap(DiscoveryProvider):
     BACKOFF = 5.0
 
     # A friendly term maps to the OSM tags that actually carry those businesses.
+    # Keys are accent-folded stems. The first match wins, so the original
+    # trades stay above newer ones: "cosmetic dentist" must still hit
+    # dentist, not a cosmetics shop. There is no catch-all entry.
     TAG_MAP = {
-        "roof": ['craft=roofer', 'shop=roofing'],
-        "plumb": ['craft=plumber'],
-        "hvac": ['craft=hvac'],
-        "electric": ['craft=electrician'],
-        "dentist": ['amenity=dentist'],
-        "lawyer": ['office=lawyer'],
-        "attorney": ['office=lawyer'],
-        "contractor": ['craft=builder', 'office=construction_company'],
-        "landscap": ['craft=gardener', 'shop=garden_centre'],
+        "roof": ["craft=roofer", "shop=roofing"],
+        "plumb": ["craft=plumber"],
+        "hvac": ["craft=hvac"],
+        "electric": ["craft=electrician"],
+        "dentist": ["amenity=dentist"],
+        "lawyer": ["office=lawyer"],
+        "attorney": ["office=lawyer"],
+        "contractor": ["craft=builder", "office=construction_company"],
+        "landscap": ["craft=gardener", "shop=garden_centre"],
+        # Food and drink producers. Specific stems before the broader ones.
+        "cervej": ["craft=brewery"],
+        "brewer": ["craft=brewery"],
+        "vinicol": ["craft=winery"],
+        "vineyard": ["craft=winery"],
+        "winery": ["craft=winery"],
+        "adega": ["shop=wine", "craft=winery"],
+        "destil": ["craft=distillery"],
+        "distill": ["craft=distillery"],
+        "cachac": ["craft=distillery"],
+        "confeit": ["craft=confectionery", "shop=confectionery", "shop=pastry"],
+        "confection": ["craft=confectionery", "shop=pastry"],
+        "doceria": ["craft=confectionery", "shop=pastry"],
+        "pastry": ["craft=confectionery", "shop=pastry"],
+        "padaria": ["shop=bakery"],
+        "panific": ["shop=bakery"],
+        "baker": ["shop=bakery"],
+        "alimento": [
+            "shop=butcher", "shop=greengrocer", "shop=deli", "shop=dairy",
+            "shop=seafood", "shop=farm", "craft=cheese",
+        ],
+        "food": [
+            "shop=butcher", "shop=greengrocer", "shop=deli", "shop=dairy",
+            "shop=seafood", "shop=farm", "craft=cheese",
+        ],
+        # Cosmetics, clothing, pharmacy. "cosmet" is after "dentist" above.
+        "cosmet": ["shop=cosmetics", "shop=perfumery"],
+        "perfum": ["shop=cosmetics", "shop=perfumery"],
+        "confecc": ["shop=clothes", "craft=tailor", "craft=dressmaker"],
+        "vestuar": ["shop=clothes"],
+        "alfaiat": ["craft=tailor"],
+        "costur": ["craft=tailor"],
+        "tailor": ["craft=tailor"],
+        "dressmaker": ["craft=dressmaker", "craft=tailor"],
+        "cloth": ["shop=clothes"],
+        "apparel": ["shop=clothes"],
+        "roupa": ["shop=clothes"],
+        "manipula": ["shop=chemist", "shop=pharmacy", "amenity=pharmacy"],
+        "drogaria": ["shop=chemist", "shop=pharmacy", "amenity=pharmacy"],
+        "farmac": ["shop=chemist", "shop=pharmacy", "amenity=pharmacy"],
+        "pharmac": ["shop=chemist", "shop=pharmacy", "amenity=pharmacy"],
+        "chemist": ["shop=chemist", "amenity=pharmacy"],
+        # Physical premises only. Pure online stores are thin on OSM;
+        # wholesale is the closest mapped stand-in, not a catch-all office.
+        "ecommerce": ["shop=wholesale"],
+        "comercio eletronico": ["shop=wholesale"],
+        "loja virtual": ["shop=wholesale"],
+        "atacad": ["shop=wholesale"],
+        "wholesale": ["shop=wholesale"],
+        "fabrica": ["industrial=factory", "man_made=works"],
+        "factory": ["industrial=factory", "man_made=works"],
+        "industria": ["industrial=factory", "man_made=works"],
+        "manufacture": ["industrial=factory", "man_made=works"],
+        "manufatura": ["industrial=factory", "man_made=works"],
+        "fabricante": ["industrial=factory", "man_made=works"],
     }
+
+    # What the error lists. Stems above are for matching; these are the words
+    # a person would actually type.
+    SUPPORTED_TERMS = (
+        "roofing", "plumber", "hvac", "electrician", "dentist", "lawyer",
+        "contractor", "landscaping",
+        "brewery", "cervejaria", "winery", "vinícola", "distillery", "destilaria",
+        "bakery", "padaria", "confectionery", "confeitaria",
+        "food", "alimentos", "cosmetics", "cosméticos",
+        "clothes", "confecção", "tailor", "alfaiate",
+        "pharmacy", "farmácia", "chemist", "manipulação",
+        "factory", "indústria", "e-commerce", "atacado",
+    )
 
     def _tags(self, term: str) -> list[str]:
         """The OSM tags that actually carry this kind of business, or none.
@@ -507,10 +581,13 @@ class OpenStreetMap(DiscoveryProvider):
         studios. A search this source cannot answer has to say so; filling the
         database with plausible-looking junk is far worse than returning
         nothing.
+
+        Matching ignores accents and hyphens, so "vinícola" and "vinicola"
+        hit the same tags. The first stem in ``TAG_MAP`` wins.
         """
-        low = term.lower()
+        folded = fold(term)
         for needle, tags in self.TAG_MAP.items():
-            if needle in low:
+            if needle in folded:
                 return tags
         return []
 
@@ -523,8 +600,8 @@ class OpenStreetMap(DiscoveryProvider):
         if not tags:
             raise RuntimeError(
                 f"OpenStreetMap has no category for {query.term!r}. It can only "
-                f"search mapped trades ({', '.join(sorted(self.TAG_MAP))}). Use a "
-                f"listings or SERP provider for this one.")
+                f"search mapped trades ({', '.join(self.SUPPORTED_TERMS)}). Use a "
+                f"listings or SERP provider for anything else.")
         lat, lng, radius_km = (query.coordinate.split(",") + ["", "", ""])[:3]
         radius_m = int(float(radius_km or 25) * 1000)
         clauses = "".join(
@@ -569,17 +646,22 @@ class OpenStreetMap(DiscoveryProvider):
             if not name:
                 continue
             site = tags.get("website") or tags.get("contact:website") or ""
-            city = ", ".join(x for x in (tags.get("addr:city"),
-                                         tags.get("addr:state")) if x)
+            city_name = tags.get("addr:city") or ""
+            state_name = tags.get("addr:state") or ""
+            city = ", ".join(x for x in (city_name, state_name) if x)
+            street = " ".join(x for x in (
+                tags.get("addr:housenumber"), tags.get("addr:street"),
+                tags.get("addr:suburb"),
+            ) if x)
             out.append(Business(
                 name=name,
                 domain=normalize_domain(site),
                 website=site,
                 phone=tags.get("phone") or tags.get("contact:phone") or "",
-                address=" ".join(x for x in (tags.get("addr:housenumber"),
-                                             tags.get("addr:street")) if x),
+                address=street,
                 location=city or query.location,
-                category=tags.get("craft") or tags.get("shop") or tags.get("office") or "",
+                category=query.term or tags.get("craft") or tags.get("shop")
+                or tags.get("office") or "",
                 has_website=bool(site),
                 external_id=f"osm:{el.get('type')}/{el.get('id')}",
                 source_url=f"https://www.openstreetmap.org/{el.get('type')}/{el.get('id')}",
@@ -820,13 +902,18 @@ async def _upsert(state, biz: Business, query: DiscoveryQuery) -> tuple[str, boo
     if existing:
         return existing.id, False
 
+    place = biz.location or query.location
     company = Company(
         name=biz.name,
         domain=biz.domain,
         website=biz.website,
         phone=biz.phone,
-        industry=biz.category or query.term,
-        location=biz.location or query.location,
+        address=biz.address,
+        city=(place.split(",")[0].strip() if place else ""),
+        # The search term is the segment ("cervejaria"), which is what a
+        # lead list filters on. The OSM tag value is a fallback.
+        industry=query.term or biz.category,
+        location=place,
         source=f"discover:{biz.provider}",
         source_url=biz.source_url,
         external_id=biz.external_id,

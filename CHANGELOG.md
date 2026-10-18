@@ -9,6 +9,8 @@ minor versions can still change behaviour.
 
 ### Added
 
+- **Lead lists without a mailbox.** `harvey export` writes `leads.csv` (company, segment, city, address, phone, website, ICP score and reason, and the best owner or buyer: name, title, email, confidence). `harvey scout` scores that list with no model call. Discovery, profile, scout, and export run with `channels.email.enabled: false` and `provider: none` — no Gmail or SMTP key. `harvey export --deliverable` keeps the sequencer CSV.
+- **Brazil prospecting.** OpenStreetMap maps Portuguese and English trade words (cervejaria, vinícola, padaria, confecção, farmácia de manipulação, and the rest), accents ignored. The profiler reads `/quem-somos`, `/contato`, and titles such as sócio and comprador. `language: pt-BR` localizes score reasons and signal labels. `compliance.regime: br` is the LGPD note, and descadastro wording is an opt-out. See `examples/harvey.local.yaml`.
 - **Microsoft 365 mail provider.** Set `channels.email.provider: microsoft` to
   send and read through a Microsoft 365 / Outlook mailbox via Microsoft Graph,
   for domains whose mail lives in Exchange Online (which no longer accepts

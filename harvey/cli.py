@@ -333,41 +333,82 @@ def cmd_usage(args):
 
 
 def cmd_export(args):
-    """Export the prospect list as a sequencer-ready CSV."""
+    """Export the lead list, or a sequencer CSV when asked for deliverable mail."""
+    from harvey.config import load_config
     from harvey.state import StateManager
-    from harvey.export import export_prospects_csv
+    from harvey.export import export_leads_csv, export_prospects_csv
+
+    sequencer = bool(args.deliverable or args.all or args.email_status or args.status)
 
     async def _export():
         state = StateManager()
         await state.init_db()
+        if sequencer:
+            email_statuses = None
+            if args.email_status:
+                email_statuses = [s.strip() for s in args.email_status.split(",") if s.strip()]
+            statuses = None
+            if args.status:
+                statuses = [s.strip() for s in args.status.split(",") if s.strip()]
+            out = args.out or "prospects.csv"
+            count, _ = await export_prospects_csv(
+                state,
+                out_path=out,
+                email_statuses=email_statuses,
+                min_score=args.min_score,
+                statuses=statuses,
+                include_all=args.all,
+            )
+            scope = "all prospects" if args.all else (
+                f"email status {email_statuses or ['verified', 'risky']}"
+                + (f", score >= {args.min_score}" if args.min_score else "")
+            )
+            print(f"\n  Exported {count} prospect(s) to {out}  ({scope})")
+            if count == 0 and not args.all:
+                print("  Tip: no deliverable emails yet? Add a REOON_API_KEY to .env so")
+                print("  Harvey can verify addresses, or use --all for the raw list.\n")
+            else:
+                print("  The CSV imports directly into Instantly, Smartlead, or any sequencer.\n")
+            return
 
-        email_statuses = None
-        if args.email_status:
-            email_statuses = [s.strip() for s in args.email_status.split(",") if s.strip()]
-        statuses = None
-        if args.status:
-            statuses = [s.strip() for s in args.status.split(",") if s.strip()]
-
-        count, _ = await export_prospects_csv(
-            state,
-            out_path=args.out,
-            email_statuses=email_statuses,
-            min_score=args.min_score,
-            statuses=statuses,
-            include_all=args.all,
+        config = None
+        try:
+            config = load_config()
+        except Exception:
+            config = None
+        out = args.out or "leads.csv"
+        count, _ = await export_leads_csv(
+            state, out_path=out, config=config, min_score=args.min_score,
         )
-        scope = "all prospects" if args.all else (
-            f"email status {email_statuses or ['verified', 'risky']}"
-            + (f", score >= {args.min_score}" if args.min_score else "")
-        )
-        print(f"\n  Exported {count} prospect(s) to {args.out}  ({scope})")
-        if count == 0 and not args.all:
-            print("  Tip: no deliverable emails yet? Add a REOON_API_KEY to .env so")
-            print("  Harvey can verify addresses, or use --all for the raw list.\n")
-        else:
-            print("  The CSV imports directly into Instantly, Smartlead, or any sequencer.\n")
+        print(f"\n  Exported {count} company lead(s) to {out}")
+        print("  One row per company: segment, city, phone, site, ICP score,")
+        print("  and the best owner or buyer found (name, title, email).\n")
 
     asyncio.run(_export())
+
+
+def cmd_scout(args):
+    """Score the lead list. No mailbox and no model call."""
+    from harvey.agents.scout import Scout
+    from harvey.brain import Brain
+    from harvey.config import load_config, load_env
+    from harvey.state import StateManager
+
+    async def _scout():
+        config = load_config()
+        env = load_env()
+        state = StateManager()
+        await state.init_db()
+        scout = Scout(Brain(state, config.brain), state, config, env)
+        result = await scout.score_lead_list(scrape=not args.no_scrape)
+        print(
+            f"\n  Lead list scored: {result['scored']} companies, "
+            f"{result['imported']} contacts from profiles, "
+            f"{result['scraped']} from sites."
+        )
+        print("  Next: harvey export\n")
+
+    asyncio.run(_scout())
 
 
 def cmd_gmail(args):
@@ -566,7 +607,8 @@ def cmd_discover(args):
 
         for err in result.errors[:5]:
             print(f"    ! {err}")
-        print("\n  Next: harvey dashboard → Signals → cohort builder\n")
+        print("\n  Next: harvey scout, then harvey export")
+        print("  Or review signals: harvey dashboard → Signals\n")
 
     asyncio.run(_discover())
 
@@ -603,7 +645,10 @@ def cmd_signals(args):
             print(f"\n  {changed} signal(s) {status}.\n")
             return
 
-        rows = await state.get_signal_codes()
+        from harvey.signals import active_language, localize_signal
+
+        language = active_language()
+        rows = [localize_signal(r, language) for r in await state.get_signal_codes()]
         counts = {c["signal_code"]: c for c in await state.signal_counts()}
         by_status = {"confirmed": 0, "proposed": 0, "rejected": 0}
         for r in rows:
@@ -715,17 +760,31 @@ def main():
 
     # harvey export
     sub = subparsers.add_parser(
-        "export", help="Export prospects as a sequencer-ready CSV"
+        "export",
+        help="Export the lead list (or a sequencer CSV with --deliverable)",
     )
-    sub.add_argument("--out", default="prospects.csv", help="Output file (default: prospects.csv)")
+    sub.add_argument("--out", default="", help="Output file (default: leads.csv, or prospects.csv for sequencer export)")
+    sub.add_argument("--min-score", type=int, default=0, help="Minimum ICP score")
+    sub.add_argument(
+        "--deliverable", action="store_true",
+        help="Sequencer CSV of verified/risky emails instead of the lead list",
+    )
     sub.add_argument(
         "--email-status", default="",
-        help="Comma-separated statuses to include (default: verified,risky)",
+        help="Sequencer export: comma-separated statuses (default: verified,risky)",
     )
-    sub.add_argument("--min-score", type=int, default=0, help="Minimum ICP score")
-    sub.add_argument("--status", default="", help="Comma-separated pipeline statuses (e.g. new,queued)")
-    sub.add_argument("--all", action="store_true", help="Export everything, no filters")
+    sub.add_argument("--status", default="", help="Sequencer export: pipeline statuses (e.g. new,queued)")
+    sub.add_argument("--all", action="store_true", help="Sequencer export of every prospect, no filters")
     sub.set_defaults(func=cmd_export)
+
+    sub = subparsers.add_parser(
+        "scout", help="Score companies into a lead list (no mailbox, no model)"
+    )
+    sub.add_argument(
+        "--no-scrape", action="store_true",
+        help="Use profile observations only; do not fetch team pages",
+    )
+    sub.set_defaults(func=cmd_scout)
 
     # harvey gmail auth|test
     sub = subparsers.add_parser("gmail", help="Gmail provider setup")

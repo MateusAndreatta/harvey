@@ -1,9 +1,10 @@
-"""Prospect-list export — the list itself is the product.
+"""Exports.
 
-Produces a CSV that drops straight into Instantly, Smartlead, or any
-sequencer (email / first_name / last_name / company_name / personalization
-columns), plus Harvey's own quality columns (score, email_status, signals)
-so a human can eyeball what they're getting.
+Two products:
+
+* A sequencer CSV (``CSV_COLUMNS``) for people who send cold email.
+* A lead-list CSV (``LEAD_COLUMNS``) for people who only want the list:
+  one row per company, with the best owner or buyer Harvey found.
 """
 
 import csv
@@ -23,6 +24,13 @@ CSV_COLUMNS = [
 ]
 
 DEFAULT_EMAIL_STATUSES = ["verified", "risky"]
+
+# One row per company. A business with no email is still a lead.
+LEAD_COLUMNS = [
+    "company_name", "segment", "city", "address", "phone", "website",
+    "icp_score", "icp_reason",
+    "contact_name", "contact_title", "contact_email", "email_confidence",
+]
 
 
 async def collect_prospects(
@@ -120,4 +128,113 @@ async def export_prospects_csv(
         with open(out_path, "w", newline="") as f:
             f.write(text)
         logger.info(f"Exported {len(rows)} prospects to {out_path}")
+    return len(rows), text
+
+
+def _website(company) -> str:
+    site = (getattr(company, "website", "") or "").strip()
+    if site:
+        return site
+    domain = (getattr(company, "domain", "") or "").strip()
+    return f"https://{domain}" if domain else ""
+
+
+def _city(company) -> str:
+    city = (getattr(company, "city", "") or "").strip()
+    if city:
+        return city
+    location = (getattr(company, "location", "") or "").strip()
+    return location.split(",")[0].strip() if location else ""
+
+
+def _lead_score(company, config):
+    """Stored score when scout already wrote one, otherwise compute it."""
+    stored = int(getattr(company, "icp_score", 0) or 0)
+    reason = (getattr(company, "icp_reason", "") or "").strip()
+    if stored > 0 or config is None:
+        return stored, reason
+    from harvey.scoring import score_company
+    return score_company(company, config)
+
+
+async def collect_leads(
+    state: StateManager,
+    config=None,
+    min_score: int = 0,
+) -> list[dict]:
+    """One row per company, best owner or buyer attached when one exists.
+
+    Companies with no contact and no email are included. A published
+    inbox (contato@) is labeled ``published`` so it is not mistaken for
+    a verified personal mailbox.
+    """
+    from harvey.scoring import pick_best_contact
+
+    companies = await state.list_companies()
+    prospects = await state.list_prospects()
+    by_company: dict[str, list] = {}
+    for prospect in prospects:
+        if prospect.company_id:
+            by_company.setdefault(prospect.company_id, []).append(prospect)
+
+    rows = []
+    for company in companies:
+        score, reason = _lead_score(company, config)
+        if min_score and score < min_score:
+            continue
+        best = pick_best_contact(by_company.get(company.id) or [])
+        phone = (getattr(company, "phone", "") or "").strip()
+        contact_name = contact_title = contact_email = confidence = ""
+        if best is not None:
+            contact_name = best.full_name()
+            contact_title = (best.title or "").strip()
+            if (best.phone or "").strip():
+                phone = best.phone.strip()
+            if (best.email or "").strip():
+                contact_email = best.email.strip()
+                confidence = (best.email_status or "").strip() or "guess"
+        public = (getattr(company, "public_email", "") or "").strip()
+        if not contact_email and public:
+            contact_email = public
+            confidence = "published"
+        rows.append({
+            "company_name": company.name,
+            "segment": company.industry or "",
+            "city": _city(company),
+            "address": company.address or "",
+            "phone": phone,
+            "website": _website(company),
+            "icp_score": score,
+            "icp_reason": reason,
+            "contact_name": contact_name,
+            "contact_title": contact_title,
+            "contact_email": contact_email,
+            "email_confidence": confidence,
+        })
+    rows.sort(key=lambda r: (-int(r["icp_score"] or 0), r["company_name"].lower()))
+    return rows
+
+
+def leads_to_csv(rows: list[dict]) -> str:
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=LEAD_COLUMNS, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow(row)
+    return buf.getvalue()
+
+
+async def export_leads_csv(
+    state: StateManager,
+    out_path: str | None = None,
+    config=None,
+    min_score: int = 0,
+) -> tuple[int, str]:
+    """Export the lead list. Returns (row_count, csv_text)."""
+    rows = await collect_leads(state, config=config, min_score=min_score)
+    text = leads_to_csv(rows)
+    if out_path:
+        with open(out_path, "w", newline="") as f:
+            f.write(text)
+        logger.info(f"Exported {len(rows)} leads to {out_path}")
     return len(rows), text

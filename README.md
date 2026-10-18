@@ -44,6 +44,7 @@ anything, and approving mail one message at a time:
 - [The dashboard](#the-dashboard)
 - [How the data is stored](#how-the-data-is-stored)
 - [Configuration](#configuration)
+- [Lead lists in Brazil](#lead-lists-in-brazil)
 - [Using a ChatGPT plan instead (Codex)](#using-a-chatgpt-plan-instead-codex)
 - [Legal and deliverability](#legal-and-deliverability)
 - [Troubleshooting](#troubleshooting)
@@ -383,7 +384,7 @@ Other tables: `companies`, `prospects`, `campaigns`, `conversations`, `outbox`, 
 
 Two files, both plain text.
 
-**`.env`** — credentials. Every variable documented inline with where to get it. The only required one is a mail provider; everything else is optional.
+**`.env`** — credentials. Every variable documented inline with where to get it. A mail provider is required only if Harvey sends. Discovery, profiling, scoring, and `harvey export` run with no Gmail, SMTP, or other mailbox key.
 
 **`harvey.yaml`** — who Harvey is and who it sells to:
 
@@ -391,11 +392,13 @@ Two files, both plain text.
 persona:      { name, company, role, email, tone }
 product:      { name, description, pricing, key_benefits, objection_responses, offer }
 icp:          { industries, titles, company_size, geography, hiring_signals, geo_coordinates }
+language:     en | pt-BR          # scoring reasons and signal labels; en by default
 channels:
-  email:      { provider: gmail | microsoft | smtp | instantly, max_daily_sends, require_approval,
-                send_to_risky, max_bounce_rate }
+  email:      { enabled, provider: gmail | microsoft | smtp | instantly | none,
+                max_daily_sends, require_approval, send_to_risky, max_bounce_rate }
 usage:        { max_daily_claude_percent, heartbeat_interval_minutes, quiet_hours }
 brain:        { provider: claude | codex, model, reasoning_effort }   # optional; claude by default
+compliance:   { regime: "" | us | uk | eu | ca | br, precleared }
 ```
 
 `max_daily_claude_percent` caps whichever subscription `brain.provider` uses (the name predates Codex support).
@@ -410,16 +413,40 @@ harvey dashboard             # web UI at localhost:5555
 harvey signals               # review/confirm what to prospect against
 harvey discover              # find businesses; --providers / --estimate
 harvey profile               # read discovered companies' sites (free)
+harvey scout                 # score the lead list (no mailbox, no model)
 harvey train <url>           # learn a product from its website (--provider codex --model gpt-5.5)
 harvey status                # pipeline summary
 harvey usage                 # active provider's quota + per-agent tokens
 harvey outbox                # review queued email
-harvey export                # deliverable prospects → CSV
+harvey export                # lead list → leads.csv (company, segment, contact)
+harvey export --deliverable  # verified/risky emails → sequencer CSV
 harvey sending pause|resume  # kill switch
 harvey gmail auth            # one-time Gmail OAuth
 harvey microsoft auth|test  # one-time Microsoft 365 sign-in (docs/microsoft365.md)
 ```
 
+
+## Lead lists in Brazil
+
+Harvey can stop at the list. Set `channels.email.enabled: false` and `provider: none` (see [`examples/harvey.local.yaml`](examples/harvey.local.yaml)) and the heartbeat profiles sites and scores companies. It does not draft, send, or wait on a Claude or Codex login. No Gmail, SMTP, or Instantly key is required.
+
+```bash
+cp examples/harvey.local.yaml harvey.local.yaml   # then edit the placeholders
+harvey discover          # free OpenStreetMap source; estimates first
+harvey profile           # already runs at the end of discover
+harvey scout             # ICP score and owner/buyer from the pages already read
+harvey export            # leads.csv
+```
+
+`leads.csv` has one row per company: name, segment, city, address, phone, website, ICP score and reason, and the best owner or purchasing contact (name, title, email, email confidence). A company with no email is still a row. An inbox copied off the site (`contato@`) is marked `published`, not verified. `harvey export --deliverable` is the older sequencer file (verified and risky emails only).
+
+`language: pt-BR` writes the score reason and the Signals tab in Brazilian Portuguese. Email prompt files stay as they are; this path does not send them. `compliance.regime: br` is the LGPD note (legitimate interest for role-relevant B2B contact, sender identification, a clear descadastro) for the day sending is turned on. Descadastro wording is honored either way.
+
+OpenStreetMap understands the trade words in that example (cervejaria, vinícola, padaria, confecção, farmácia de manipulação, and the English equivalents), accents ignored. It maps premises. A brewery with a taproom shows up; a store that exists only online usually does not. E-commerce is matched to wholesale shops, which is a thin stand-in, not a directory of lojas virtuais. For a denser local list, `harvey discover --providers` shows the paid sources.
+
+The geography keys must match `icp.geo_coordinates` exactly (`"Curitiba, PR"`, not `Curitiba`). The example uses a 40 km radius around Curitiba and São Paulo.
+
+---
 
 ## Using a ChatGPT plan instead (Codex)
 
@@ -462,6 +489,8 @@ Harvey automates outreach, but **you are the sender.** Cold email is legal in mo
 
 **GDPR / PECR (EU & UK).** B2B cold email needs a defensible legitimate interest: the pitch must be genuinely relevant to that person's role, you must know where the data came from, and objecting must be effortless. If you can't say why a specific person would care, Harvey shouldn't email them — and its qualification rules say so.
 
+**LGPD (Brazil).** Set `compliance.regime: br` when mail is on. B2B contact uses legitimate interest only when the message is relevant to the person's role. Every email identifies the sender and includes a clear descadastro. Harvey treats descadastro, "não quero mais", and "pare de enviar" as an immediate, permanent opt-out. A lead-list install does not send, so the regime only changes copy on the day sending is enabled.
+
 **Per-recipient check (optional).** Those rules turn on facts about each recipient: a UK sole trader needs consent where a limited company doesn't, Germany wants prior consent even for business email, and Canada's CASL depends on whether the address was published. With `compliance.precleared.enabled: true`, Harvey asks [Precleared](https://precleared.dev) about each new recipient before the first cold email. Anything other than `ok_to_email` holds that email back, with the rule and the next step shown in the Outbox, and the signed receipt id is logged with every send. One check per address, cached for 30 days (changing the sender country, address source or product description triggers a fresh check); replies are never checked; native providers (Gmail, SMTP) only. Precleared receives the recipient's address, your sender country, the address source and your product description. Without a key it allows 10 checks a day, and a free key (`PRECLEARED_API_KEY`) allows 25. Put the setting in `harvey.yaml`, or in `harvey.local.yaml` if you trained Harvey, since that file wins.
 
 **Bot disclosure.** Some jurisdictions require disclosing automation. Harvey is instructed to answer truthfully, always, if a prospect asks whether they're talking to an AI. Never configure it otherwise.
@@ -494,7 +523,7 @@ Harvey automates outreach, but **you are the sender.** Cold email is legal in mo
 
 **Codex calls fail** — Read the log line; every Codex error says what to do. "Not logged in" or "expired or is due for renewal" → use Codex once or run `codex login` with ChatGPT. "Hasn't been verified with Harvey" → install the supported Codex version named in the message. "Isolation could not be verified" → a Codex config layer outside your `~/.codex` (for example a managed or `/etc/codex` config) forces a tool, hook, MCP server, instructions or custom endpoint back on; Harvey refuses to send prompts until it's gone. Model catalog errors → choose an available model ID from the catalog shown in the message, or leave `brain.model` blank to select a listed model. Harvey never switches to Claude on its own.
 
-**Discovery finds nothing** — Confirm signals first (`harvey signals --confirm free`); nothing is collected until you do. If you're on the free OpenStreetMap source, it only covers mapped trades and is thin for service-area businesses — `harvey discover --providers` shows the alternatives.
+**Discovery finds nothing** — Confirm signals first (`harvey signals --confirm free`); nothing is collected until you do. If you're on the free OpenStreetMap source, it only covers mapped trades (including the Brazilian ones in [Lead lists in Brazil](#lead-lists-in-brazil)) and is thin for service-area businesses and online-only stores — `harvey discover --providers` shows the alternatives.
 
 **Overpass is throttling** — It's free volunteer infrastructure. Harvey walks three mirrors before giving up. Wait a few minutes, or use a paid provider for bulk work.
 

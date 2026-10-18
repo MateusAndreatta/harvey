@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 
 from harvey.brain import Brain, BrainUnavailable
 from harvey.config import HarveyConfig, EnvConfig
+from harvey.textutil import fold
 from harvey.integrations.instantly import InstantlyClient
 from harvey.integrations.mail_provider import NATIVE_PROVIDERS, get_mail_provider
 from harvey.models.conversation import Conversation, Message
@@ -57,6 +58,17 @@ OPT_OUT_PATTERNS = (
     "never contact",
     "delete my info",
     "delete my data",
+    # Portuguese. Matching is accent-folded, so "não" and "nao" both hit.
+    "descadastr",
+    "cancelar inscricao",
+    "nao quero mais",
+    "pare de enviar",
+    "pare de me enviar",
+    "remover meu email",
+    "nao me contate",
+    "nao me envie",
+    "me tire da lista",
+    "sair da lista",
 )
 
 # Phrases that mean a human must take over. Never auto-reply to these.
@@ -75,7 +87,26 @@ ESCALATION_PATTERNS = (
     "gdpr",
     "can-spam",
     "blacklist",
+    "lgpd",
+    "procon",
+    "advogado",
+    "vou processar",
+    "processo judicial",
 )
+
+
+def _folded_hit(text: str, patterns: tuple[str, ...]) -> bool:
+    folded = fold(text or "")
+    return any(fold(p) in folded for p in patterns)
+
+
+def is_opt_out(text: str) -> bool:
+    """True when the reply asks to stop, in English or Portuguese."""
+    return _folded_hit(text, OPT_OUT_PATTERNS)
+
+
+def is_escalation(text: str) -> bool:
+    return _folded_hit(text, ESCALATION_PATTERNS)
 
 
 class Handler:
@@ -223,10 +254,9 @@ class Handler:
 
         # 1. Classify intent. Hard keyword checks run FIRST and override
         # the LLM — opt-outs and legal threats must never be missed.
-        text_lower = reply_text.lower()
-        if any(p in text_lower for p in OPT_OUT_PATTERNS):
+        if is_opt_out(reply_text):
             intent = "unsubscribe"
-        elif any(p in text_lower for p in ESCALATION_PATTERNS):
+        elif is_escalation(reply_text):
             intent = "escalate"
         else:
             intent = await self._classify_intent(reply_text, prospect)
@@ -514,6 +544,8 @@ class Handler:
 
 When in doubt between "not_interested" and "unsubscribe", choose "unsubscribe".
 When in doubt between anything and "escalate", choose "escalate".
+Portuguese: descadastro, "não quero mais", and "pare de enviar" are unsubscribe.
+LGPD, Procon, and advogado are escalate.
 
 Reply from {prospect.full_name()} ({prospect.title} at {prospect.company}):
 \"\"\"{reply_text}\"\"\"

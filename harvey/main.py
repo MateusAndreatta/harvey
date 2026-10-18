@@ -10,6 +10,7 @@ import pytz
 
 from harvey.brain import Brain
 from harvey.config import ConfigError, load_config, load_env, HarveyConfig
+from harvey.locale import email_sending_enabled
 from harvey.pipeline import run_profile_stage
 from harvey.state import StateManager
 
@@ -94,11 +95,12 @@ async def decide_next_action(
     draft_campaigns = summary.get("draft_campaigns", 0) or 0
     open_conversations = summary.get("open_conversations", 0) or 0
 
-    if open_conversations > 0:
+    sending = email_sending_enabled(config)
+    if sending and open_conversations > 0:
         action, reason = "handle_replies", f"{open_conversations} open conversation(s) waiting"
-    elif draft_campaigns > 0:
+    elif sending and draft_campaigns > 0:
         action, reason = "send_campaign", f"{draft_campaigns} draft campaign(s) ready to deploy"
-    elif new_prospects > 0:
+    elif sending and new_prospects > 0:
         action, reason = "write_campaign", f"{new_prospects} new prospect(s) with no drafts ready"
     elif new_prospects < 20:
         action, reason = "prospect", f"only {new_prospects} new prospect(s); pipeline needs leads"
@@ -153,6 +155,21 @@ async def _interruptible_sleep(seconds: float, stop_event: asyncio.Event) -> boo
         return True
     except asyncio.TimeoutError:
         return False
+
+
+async def run_list_cycle(state: StateManager, scout) -> dict:
+    """Profile, then score. Sequential so scoring sees the people just found.
+
+    No model call and no mailbox. Discovery stays a separate command because
+    it can spend money.
+    """
+    summary = await state.get_state_summary()
+    profiled = 0
+    if summary.get("unprofiled", 0):
+        report = await run_profile_stage(state, limit=25)
+        profiled = getattr(report, "profiled_companies", 0) or 0
+    scored = await scout.score_lead_list()
+    return {"profiled": profiled, **scored}
 
 
 async def heartbeat(stop_event: asyncio.Event | None = None):
@@ -220,6 +237,30 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
                         shutting_down = True
                         break
                 if shutting_down:
+                    break
+                continue
+
+            # Lead lists do not send, draft, or call the model. Profile, then
+            # score, and skip the brain check that would pause the whole cycle.
+            if not email_sending_enabled(config):
+                logger.info(
+                    "Lead-list mode: email sending is off. "
+                    "Profiling and scoring, not writing or sending."
+                )
+                cycle = await run_list_cycle(state, scout)
+                logger.info(
+                    "Lead list: %(profiled)s sites read, %(imported)s contacts "
+                    "from profiles, %(scraped)s from sites, %(scored)s scored."
+                    % cycle
+                )
+                try:
+                    await state.log_action(
+                        action_type="score_leads", agent="main", details=cycle,
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to log lead-list cycle: {e}")
+                consecutive_errors = 0
+                if await _interruptible_sleep(interval, stop_event):
                     break
                 continue
 
