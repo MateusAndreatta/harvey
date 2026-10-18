@@ -554,11 +554,17 @@ async def get_stats():
         actions = await query_db("SELECT COUNT(*) as count FROM actions")
         action_count = actions[0]["count"] if actions else 0
 
+        try:
+            await _state().init_db()
+        except Exception:
+            pass
         usage = await query_db(
-            "SELECT claude_calls, codex_calls FROM usage_log WHERE date = date('now')"
+            "SELECT claude_calls, codex_calls, cursor_calls "
+            "FROM usage_log WHERE date = date('now')"
         )
         usage_today = (usage[0]["claude_calls"] or 0) if usage else 0
         codex_today = (usage[0]["codex_calls"] or 0) if usage else 0
+        cursor_today = (usage[0]["cursor_calls"] or 0) if usage else 0
 
         return {
             "prospects": {"total": prospect_total, "by_status": prospect_map},
@@ -567,6 +573,7 @@ async def get_stats():
             "actions_total": action_count,
             "claude_calls_today": usage_today,
             "codex_calls_today": codex_today,
+            "cursor_calls_today": cursor_today,
             "brain_provider": _active_provider(),
             "brain_status": await _brain_status(),
         }
@@ -623,6 +630,7 @@ def _quota_client_for(provider: str, model: str = ""):
             from harvey.integrations.quota import QuotaClient
             _quota_clients[key] = QuotaClient()
         else:
+            # Cursor has no quota API. Callers use the daily call counter.
             return None
     return _quota_clients[key]
 
@@ -660,20 +668,39 @@ async def get_usage():
     brain = _active_brain()
     provider = brain.provider if brain else ""
     quota = None
-    try:
-        client = _quota_client_for(provider, brain.model if brain else "")
-        if client is not None:
-            quota = await client.get_utilization()
-    except Exception as e:
-        logger.debug("Quota lookup failed: %s", e)
+    cursor_calls_today = 0
+    cursor_daily_cap = None
+    if provider == "cursor":
+        # No live gauge. The budget is Harvey's own call count.
+        quota_status = "call_budget"
+        try:
+            from harvey.config import cursor_call_cap
+            from harvey.state import StateManager
+            cursor_daily_cap = cursor_call_cap()
+            sm = StateManager(db_path=str(DB_PATH))
+            await sm.init_db()
+            cursor_calls_today = await sm.get_usage_today("cursor")
+        except Exception as e:
+            logger.debug("Cursor call budget lookup failed: %s", e)
+    else:
+        try:
+            client = _quota_client_for(provider, brain.model if brain else "")
+            if client is not None:
+                quota = await client.get_utilization()
+        except Exception as e:
+            logger.debug("Quota lookup failed: %s", e)
+        quota_status = ("available" if quota else "unavailable") if provider else ""
 
     return {
         "provider": provider,
         "quota": quota,
         # Whose quota this is, even when it couldn't be read, so the UI shows
         # "unavailable" for the active provider instead of hiding the gauge.
+        # Cursor uses quota_status "call_budget" (its own daily call cap).
         "quota_provider": provider,
-        "quota_status": ("available" if quota else "unavailable") if provider else "",
+        "quota_status": quota_status,
+        "cursor_calls_today": cursor_calls_today,
+        "cursor_daily_cap": cursor_daily_cap,
         "by_provider": by_provider,
         "totals": totals,
         "by_day": by_day,

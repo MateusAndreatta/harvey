@@ -224,9 +224,10 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
                 continue
 
             # 2. Is the brain usable at all? (Codex: CLI version, isolation,
-            # login, account and model checked without a prompt.) If not, do nothing
-            # this cycle — no replies consumed, nothing written or sent —
-            # and say why, rather than running agents that would each fail.
+            # login, account and model. Cursor: CLI and login. Neither check
+            # sends a prompt.) If not, do nothing this cycle — no replies
+            # consumed, nothing written or sent — and say why, rather than
+            # running agents that would each fail.
             problem = await brain.preflight()
             if problem:
                 logger.error(
@@ -238,15 +239,29 @@ async def heartbeat(stop_event: asyncio.Event | None = None):
                 continue
 
             # 3. Check usage budget (real subscription quota when readable,
-            # else Harvey's own call counter)
-            if not await brain.is_within_budget(
-                max_calls, max_percent=config.usage.max_daily_claude_percent
-            ):
-                logger.info(
-                    f"{brain.provider_label} usage limit reached "
-                    f"({config.usage.max_daily_claude_percent}% of quota or "
-                    f"{max_calls} calls). Sleeping 1h, then re-checking."
+            # else Harvey's own call counter). Cursor has no quota API, so
+            # its cap is usage.max_daily_cursor_calls and nothing else.
+            if brain.provider == "cursor":
+                within_budget = await brain.is_within_budget(
+                    config.usage.max_daily_cursor_calls, max_percent=None,
                 )
+            else:
+                within_budget = await brain.is_within_budget(
+                    max_calls, max_percent=config.usage.max_daily_claude_percent,
+                )
+            if not within_budget:
+                if brain.provider == "cursor":
+                    logger.info(
+                        f"Cursor daily call cap reached "
+                        f"({config.usage.max_daily_cursor_calls}). "
+                        "Sleeping 1h, then re-checking."
+                    )
+                else:
+                    logger.info(
+                        f"{brain.provider_label} usage limit reached "
+                        f"({config.usage.max_daily_claude_percent}% of quota or "
+                        f"{max_calls} calls). Sleeping 1h, then re-checking."
+                    )
                 if await _interruptible_sleep(3600, stop_event):
                     break
                 continue

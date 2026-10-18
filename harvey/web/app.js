@@ -888,18 +888,26 @@ async function loadStats() {
 // Calls today per subscription — each labelled with the provider it ran on.
 function brainCallChips(data) {
   const chip = (label, n) => '<span class="chip">' + label + ' calls today <b>' + escHtml(String(n || 0)) + '</b></span>';
-  const codex = data.codex_calls_today || 0;
+  const counts = {
+    claude: data.claude_calls_today || 0,
+    codex: data.codex_calls_today || 0,
+    cursor: data.cursor_calls_today || 0,
+  };
+  const labels = {claude: 'Claude', codex: 'Codex', cursor: 'Cursor'};
   const st = data.brain_status || {};
+  const pausedName = labels[st.provider] || 'Brain';
   // A paused brain must not look healthy: say so, and why.
   const paused = st.status === 'paused'
     ? '<span class="chip" title="' + escHtml(st.reason || '') + '">' +
-      escHtml(st.provider === 'codex' ? 'Codex' : 'Brain') + ' <b>paused</b>: ' +
+      escHtml(pausedName) + ' <b>paused</b>: ' +
       escHtml((st.reason || '').slice(0, 120)) + '</span>'
     : '';
-  if (data.brain_provider === 'codex') {
-    return paused + chip('Codex', codex) + (data.claude_calls_today ? chip('Claude', data.claude_calls_today) : '');
-  }
-  return paused + chip('Claude', data.claude_calls_today) + (codex ? chip('Codex', codex) : '');
+  const active = data.brain_provider || 'claude';
+  let html = paused + chip(labels[active] || 'Claude', counts[active] || 0);
+  ['claude', 'codex', 'cursor'].forEach(function (key) {
+    if (key !== active && counts[key]) html += chip(labels[key], counts[key]);
+  });
+  return html;
 }
 
 function fmtTokens(n) {
@@ -926,6 +934,14 @@ function emailTag(p) {
 function quotaCardHtml(data) {
   const provider = data && data.quota_provider;
   if (!provider) return '';
+  if (provider === 'cursor' || data.quota_status === 'call_budget') {
+    const used = data.cursor_calls_today || 0;
+    const cap = (data.cursor_daily_cap === 0 || data.cursor_daily_cap) ? String(data.cursor_daily_cap) : '200';
+    return '<h2>Cursor call budget</h2>' +
+      '<p class="muted">Cursor has no live quota API. Harvey stops at ' + escHtml(cap) +
+      ' of its own calls per day (usage.max_daily_cursor_calls).</p>' +
+      '<p>' + escHtml(String(used)) + ' / ' + escHtml(cap) + ' calls today</p>';
+  }
   const title = provider === 'codex' ? 'Codex (ChatGPT plan) Quota' : 'Claude Subscription Quota';
   let html = '<h2>' + escHtml(title) + '</h2>';
   if (!data.quota || !Object.keys(data.quota).length) {

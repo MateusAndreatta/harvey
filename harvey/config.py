@@ -187,6 +187,9 @@ class QuietHoursConfig(BaseModel):
 
 class UsageConfig(BaseModel):
     max_daily_claude_percent: float = 80.0
+    # Cursor publishes no quota API. Harvey stops after this many of its own
+    # calls per day when brain.provider is cursor. Claude and Codex ignore it.
+    max_daily_cursor_calls: int = 200
     heartbeat_interval_minutes: int = 15
     quiet_hours: QuietHoursConfig = QuietHoursConfig()
 
@@ -197,6 +200,13 @@ class UsageConfig(BaseModel):
             raise ValueError("max_daily_claude_percent must be between 0 and 100")
         return v
 
+    @field_validator("max_daily_cursor_calls")
+    @classmethod
+    def _valid_cursor_calls(cls, v: int) -> int:
+        if v < 0:
+            raise ValueError("max_daily_cursor_calls must be >= 0")
+        return v
+
     @field_validator("heartbeat_interval_minutes")
     @classmethod
     def _valid_interval(cls, v: int) -> int:
@@ -205,7 +215,7 @@ class UsageConfig(BaseModel):
         return v
 
 
-BRAIN_PROVIDERS = ("claude", "codex")
+BRAIN_PROVIDERS = ("claude", "codex", "cursor")
 CODEX_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
 
 # Model names are passed to a CLI, so they must look like a model name and
@@ -217,9 +227,10 @@ class BrainConfig(BaseModel):
     """Which subscription Harvey thinks with.
 
     ``claude`` (default) runs Claude Code headless on your Claude plan.
-    ``codex`` runs Codex on your ChatGPT plan. There is never an automatic
-    fallback between them, and an explicit ``model`` only affects Harvey —
-    your own Claude Code / Codex settings are never read or changed.
+    ``codex`` runs Codex on your ChatGPT plan. ``cursor`` runs the Cursor
+    CLI on your Cursor plan. There is never an automatic fallback between
+    them, and an explicit ``model`` only affects Harvey — your own Claude
+    Code, Codex, or Cursor settings are never read or changed.
     """
 
     provider: str = "claude"
@@ -345,6 +356,35 @@ def load_config(config_path: str | None = None) -> HarveyConfig:
             "Fix the fields above or re-run 'harvey setup'."
         )
         raise
+
+
+def cursor_call_cap(config_path: str | None = None) -> int:
+    """``usage.max_daily_cursor_calls``, or 200 when the file can't be read.
+
+    Reads only the usage section so a half-finished product config still
+    yields a cap. An invalid section falls back to the default rather than
+    blocking the dashboard.
+    """
+    default = UsageConfig().max_daily_cursor_calls
+    if config_path is None:
+        try:
+            config_path = _find_config_file()
+        except ConfigFileNotFoundError:
+            return default
+    try:
+        with open(config_path) as f:
+            data = yaml.safe_load(f)
+    except (OSError, yaml.YAMLError):
+        return default
+    section = data.get("usage") if isinstance(data, dict) else None
+    if section is None:
+        return default
+    if not isinstance(section, dict):
+        return default
+    try:
+        return UsageConfig(**section).max_daily_cursor_calls
+    except ValidationError:
+        return default
 
 
 def load_brain_config(config_path: str | None = None) -> BrainConfig:
