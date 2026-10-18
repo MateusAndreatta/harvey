@@ -565,7 +565,7 @@ harvey/
 
 skills/                  # ← the sales knowledge. Editable Markdown.
 prompts/                 # ← agent system prompts. Also editable Markdown.
-tests/                   # 242 tests
+tests/                   # 574 tests
 ```
 
 ---

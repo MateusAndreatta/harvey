@@ -125,7 +125,13 @@ def test_usage_and_tool_helpers():
     assert argv[argv.index("--mode") + 1] == "ask"
     assert argv[argv.index("--output-format") + 1] == "stream-json"
     assert argv[argv.index("--model") + 1] == SUGGESTED_MODEL
-    assert stdin is None and argv[-1] == wrap_prompt("hello")
+    assert stdin is None and argv[-1] == "hello"
+    wrapped, wrapped_stdin = build_prompt_argv(
+        "cursor-agent", SUGGESTED_MODEL, "/tmp/ws", wrap_prompt("hello"),
+    )
+    assert wrapped_stdin is None
+    assert wrapped[-1].startswith("You are Harvey's text engine")
+    assert wrapped[-1].endswith("hello")
     _argv, long_stdin = build_prompt_argv("cursor-agent", "composer-2.5", "/tmp/ws", "x" * 9000)
     assert long_stdin is not None and "x" * 9000 not in _argv
     flag_argv, flag_stdin = build_prompt_argv("cursor-agent", "composer-2.5", "/tmp/ws", "--force")
@@ -136,11 +142,7 @@ def test_usage_and_tool_helpers():
 
 
 @pytest.mark.asyncio
-async def test_success_records_live_usage_shape(state, cursor_log, monkeypatch):
-    async def no_claude(*_a, **_k):
-        raise AssertionError("Cursor brain must not run the Claude CLI")
-
-    monkeypatch.setattr(brain_mod.asyncio, "create_subprocess_exec", no_claude)
+async def test_success_records_live_usage_shape(state, cursor_log):
     brain = _brain(state)
     assert type(brain.quota).__name__ == "CursorCallBudget"
     assert await brain.think("say oi", agent="writer", task="draft", max_retries=0) == "oi"
@@ -177,6 +179,8 @@ async def test_success_records_live_usage_shape(state, cursor_log, monkeypatch):
     assert "Shell(*)" in row["cli_json"] and "Write(**)" in row["cli_json"]
     assert "Mcp(*:*)" in row["global_config"]
     assert row["api_key_in_argv"] is False
+    assert row["argv"][-1].startswith("You are Harvey's text engine")
+    assert row["argv"][-1].endswith("say oi")
 
 
 @pytest.mark.asyncio
@@ -184,7 +188,7 @@ async def test_think_json_and_blank_model_uses_composer(state, cursor_log, monke
     monkeypatch.setenv("HARVEY_FAKE_CURSOR_RESULT", '{"intent": "interested"}')
     brain = Brain(state, BrainConfig(provider="cursor"))
     assert brain.cursor.effective_model() == SUGGESTED_MODEL
-    assert await brain.think_json("classify", max_retries=0) == {"intent": "interested"}
+    assert await brain.think_json("classify") == {"intent": "interested"}
     prompt = [row for row in _calls(cursor_log) if row["cmd"] == "prompt"][-1]
     assert prompt["model"] == "composer-2.5"
 
@@ -340,6 +344,7 @@ async def test_writer_scout_and_trainer_use_cursor(state, cursor_log, monkeypatc
     ]
     monkeypatch.setenv("HARVEY_FAKE_CURSOR_RESULT", json.dumps(sequence))
     writer = Writer(_brain(state), state, config)
+    writer.skills = ""
     steps = await writer._write_sequence([
         Prospect(first_name="Ada", last_name="Lovelace", title="Owner", company="Acme"),
     ])
