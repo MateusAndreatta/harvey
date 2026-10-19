@@ -8,7 +8,7 @@ import signal
 import subprocess
 import sys
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import aiosqlite
@@ -558,9 +558,13 @@ async def get_stats():
             await _state().init_db()
         except Exception:
             pass
+        # usage_log.date is the local calendar day from date.today().
+        # SQLite date('now') is UTC, so between 21:00 and midnight in Brazil
+        # it is already tomorrow and the day's calls disappear.
         usage = await query_db(
             "SELECT claude_calls, codex_calls, cursor_calls "
-            "FROM usage_log WHERE date = date('now')"
+            "FROM usage_log WHERE date = ?",
+            (date.today().isoformat(),),
         )
         usage_today = (usage[0]["claude_calls"] or 0) if usage else 0
         codex_today = (usage[0]["codex_calls"] or 0) if usage else 0

@@ -355,7 +355,13 @@ async def test_existing_usage_rows_become_claude(tmp_path):
             await db.executescript(script)
         await db.execute("PRAGMA user_version = 10")
         await db.execute("INSERT INTO usage_events (id, model, output_tokens) VALUES ('a', 'm', 5)")
-        await db.execute("INSERT INTO usage_log (id, date, claude_calls) VALUES ('u', date('now'), 7)")
+        # Same local day increment_usage and get_usage_today use. SQLite
+        # date('now') is UTC and misses this row after 21:00 in Brazil.
+        from datetime import date
+        await db.execute(
+            "INSERT INTO usage_log (id, date, claude_calls) VALUES ('u', ?, 7)",
+            (date.today().isoformat(),),
+        )
         await db.commit()
 
     sm = StateManager(db_path)
@@ -378,18 +384,28 @@ async def test_existing_usage_rows_become_claude(tmp_path):
 def test_trainer_uses_and_writes_back_the_selection(tmp_path, monkeypatch):
     import harvey.trainer as trainer_mod
 
+    # An operator's harvey.local.yaml lives at the repo root and wins over
+    # the selection this test is checking. Read and write only the temp dir.
+    monkeypatch.setattr(trainer_mod, "PROJECT_ROOT", tmp_path)
+    monkeypatch.chdir(tmp_path)
+    out = tmp_path / "harvey.local.yaml"
+
     monkeypatch.setattr(trainer_mod, "load_brain_config",
                         lambda: BrainConfig(provider="codex", model="gpt-5.5"))
     trainer = trainer_mod.Trainer()
     assert trainer.brain.provider == "codex" and trainer.brain.model == "gpt-5.5"
-    built = trainer._build_config({"product_name": "W"}, {}, {}, "acme.com")
+    built = trainer._build_config(
+        {"product_name": "W"}, {}, {}, "acme.com", output_path=out,
+    )
     assert built["brain"] == {"provider": "codex", "model": "gpt-5.5"}
     # The written config loads back with the same selection.
     assert HarveyConfig(**built).brain == BrainConfig(provider="codex", model="gpt-5.5")
 
     explicit = trainer_mod.Trainer(brain_config=BrainConfig())
     assert explicit.brain.provider == "claude"
-    assert explicit._build_config({}, {}, {}, "acme.com")["brain"] == {"provider": "claude"}
+    assert explicit._build_config(
+        {}, {}, {}, "acme.com", output_path=out,
+    )["brain"] == {"provider": "claude"}
 
 
 def test_cli_train_flags_select_the_provider(monkeypatch):
