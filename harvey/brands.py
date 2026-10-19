@@ -79,6 +79,7 @@ _COSMETICS_COUNTER = re.compile(
 )
 
 _MANUFACTURER = re.compile(r"industri|fabrica|manufatur|laboratorio")
+_DISTRIBUTION = re.compile(r"centro de distribuicao|distribution cent(?:er|re)")
 
 
 def _name_core(name: str) -> str:
@@ -144,6 +145,11 @@ def is_manufacturer_name(name: str) -> bool:
     return bool(_MANUFACTURER.search(fold(name)))
 
 
+def is_distribution_name(name: str) -> bool:
+    """A logistics building, not a plant. 'Centro de Distribuição …'."""
+    return bool(_DISTRIBUTION.search(fold(name)))
+
+
 def is_segment_reseller(name: str, industry: str = "", kind: str = "") -> bool:
     """Consultant or cosmetics franchise counter, not the plant.
 
@@ -183,24 +189,47 @@ def is_short_name(name: str) -> bool:
 
 
 _GENERIC_NAME = re.compile(
-    r"^(sos )?(atelie( de costura)?|costura|confeccao|loja|comercio|"
+    r"^(sos )?(atelie|costura|confeccao|loja|comercio|"
     r"empresa|salao|studio|estudio|oficina)$"
 )
+# "Ateliê de costura" and the truncated "Ateliê de costur Iza klin".
+# Extra words after the label are still the sewing room, not a company.
+# "costura da silva" does not start with ateliê, so it stays.
+_SEWING_LABEL = re.compile(r"^(sos )?atelie de costur")
+
+
+def _cleaned_name(name: str) -> str:
+    folded = fold(name)
+    return re.sub(r"\s+", " ", folded).strip(" .,-/")
+
+
+def is_sewing_label(name: str) -> bool:
+    """A sewing-room label, including one with a person's name tacked on."""
+    return bool(_SEWING_LABEL.match(_cleaned_name(name)))
 
 
 def is_generic_name(name: str) -> bool:
     """A label like 'Ateliê de costura' or 'SOS costura' with no company in it.
 
-    Anchored, so 'costura da silva' stays.
+    Anchored for the bare words, so 'costura da silva' stays. A sewing-room
+    label still matches when the name continues ('Ateliê de costur Iza klin').
     """
-    return bool(_GENERIC_NAME.match(fold(name)))
+    cleaned = _cleaned_name(name)
+    return bool(_GENERIC_NAME.match(cleaned) or is_sewing_label(name))
 
 
 def drop_thin_lead(name: str, phone: str = "", website: str = "",
                    address: str = "", domain: str = "") -> bool:
-    """Junk rows: a tiny name, or a generic one with no phone, site, or address."""
+    """Junk rows: a tiny name, or a generic one with no phone, site, or address.
+
+    A sewing-room label is dropped unless it has a phone, site, or domain.
+    The street on the map pin is not a company.
+    """
     if is_short_name(name):
         return True
     if not is_generic_name(name):
         return False
-    return not any(str(part or "").strip() for part in (phone, website, address, domain))
+    contact = (phone, website, domain)
+    if is_sewing_label(name):
+        return not any(str(part or "").strip() for part in contact)
+    return not any(str(part or "").strip() for part in (*contact, address))

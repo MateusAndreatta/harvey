@@ -32,7 +32,8 @@ import httpx
 
 from harvey.brands import (
     NEARBY_KM, brand_key, drop_thin_lead, is_competitor_name,
-    is_manufacturer_name, is_segment_reseller, name_key, resellers_excluded,
+    is_distribution_name, is_manufacturer_name, is_segment_reseller, name_key,
+    resellers_excluded,
 )
 from harvey.models import Company
 from harvey.places import (
@@ -743,15 +744,18 @@ class OpenStreetMap(DiscoveryProvider):
                                  "github.com/ethanplusai/harvey)"}
         payload = None
         last_error = "no response"
+        # The segment is in every failure line. A 502 on mirror 2 is
+        # otherwise indistinguishable from the query that just succeeded.
+        query_label = query.keyword()
         for i, endpoint in enumerate(self.ENDPOINTS):
             if i:
                 await asyncio.sleep(self.BACKOFF)
             for attempt in range(self.ATTEMPTS):
                 if attempt:
                     logger.warning(
-                        "osm: %s failed (%s) — waiting %.0fs and retrying "
-                        "the same mirror",
-                        endpoint, last_error, self.RETRY_BACKOFF,
+                        "osm: %s failed on %r (%s) — waiting %.0fs and "
+                        "retrying the same mirror",
+                        endpoint, query_label, last_error, self.RETRY_BACKOFF,
                     )
                     await asyncio.sleep(self.RETRY_BACKOFF)
                 try:
@@ -761,11 +765,16 @@ class OpenStreetMap(DiscoveryProvider):
                     )
                 except httpx.HTTPError as e:
                     last_error = str(e)
-                    logger.warning("osm: %s unreachable (%s)", endpoint, e)
+                    logger.warning(
+                        "osm: %s unreachable for %r (%s)", endpoint, query_label, e,
+                    )
                     continue
                 failure = self._overpass_failure(r)
                 if failure:
                     last_error = failure
+                    logger.warning(
+                        "osm: %s failed on %r (%s)", endpoint, query_label, failure,
+                    )
                     continue
                 if r.status_code >= 400:
                     r.raise_for_status()
@@ -776,8 +785,9 @@ class OpenStreetMap(DiscoveryProvider):
         else:
             raise RuntimeError(
                 "Every public Overpass mirror is throttling or timing out "
-                f"({last_error}). A timed-out query is not an empty market. "
-                "Wait a few minutes and re-run, or use a paid provider for bulk work."
+                f"on {query_label!r} ({last_error}). A timed-out query is not "
+                "an empty market. Wait a few minutes and re-run, or use a "
+                "paid provider for bulk work."
             )
         if payload is None:
             raise RuntimeError(f"Could not reach any Overpass mirror ({last_error}).")
@@ -788,7 +798,7 @@ class OpenStreetMap(DiscoveryProvider):
             name = tags.get("name") or ""
             if not name:
                 continue
-            kind = self._kind(tags, name)
+            kind = self._kind(tags, name, el.get("type") or "")
             center = el.get("center") or {}
             try:
                 plat = float(el.get("lat") or center.get("lat"))
@@ -913,8 +923,12 @@ class OpenStreetMap(DiscoveryProvider):
             parts.append("footprint")
         return " ".join(parts)
 
+    # industrial=warehouse / depot is a shed, not a plant. A brand pin
+    # (a node named Coca Cola, no factory tag) is not one either.
+    _PRODUCTION_INDUSTRIAL = frozenset({"factory", "manufacture", "plant"})
+
     @staticmethod
-    def _kind(tags: dict, name: str) -> str:
+    def _kind(tags: dict, name: str, element_type: str = "") -> str:
         if is_competitor_name(name) or tags.get("craft") in ("printer", "printmaker"):
             return "competitor"
         if tags.get("shop") in ("copyshop", "printer"):
@@ -924,13 +938,7 @@ class OpenStreetMap(DiscoveryProvider):
                 tags.get("shop"), tags.get("craft"), tags.get("office"),
             ) if part
         )
-        made = is_manufacturer_name(name)
-        if (
-            tags.get("craft")
-            or tags.get("industrial")
-            or tags.get("man_made") in ("works", "factory")
-            or made
-        ):
+        if OpenStreetMap._is_producer(tags, name, element_type):
             kind = "producer"
         elif tags.get("shop") or tags.get("amenity"):
             kind = "retail"
@@ -939,6 +947,30 @@ class OpenStreetMap(DiscoveryProvider):
         if is_segment_reseller(name, segment, kind):
             return "reseller"
         return kind
+
+    @classmethod
+    def _is_producer(cls, tags: dict, name: str, element_type: str) -> bool:
+        """A plant, not a distribution center or a brand pin.
+
+        ``industrial=warehouse`` and ``man_made=works`` on a node with no
+        factory tag are how a Centro de Distribuição and a Coca Cola point
+        were scored as producers. A mapped area (way or relation) with
+        ``man_made=works`` still is a plant, and so is any craft or a name
+        that says fábrica.
+        """
+        if is_distribution_name(name):
+            return False
+        industrial = tags.get("industrial") or ""
+        if industrial in cls._PRODUCTION_INDUSTRIAL:
+            return True
+        if is_manufacturer_name(name):
+            return True
+        craft = tags.get("craft") or ""
+        if craft and craft not in ("printer", "printmaker"):
+            return True
+        works = tags.get("man_made") in ("works", "factory")
+        # A node with only man_made=works is a pin. Brand points land here.
+        return bool(works and element_type != "node")
 
 
 PROVIDERS: dict[str, DiscoveryProvider] = {
@@ -1280,7 +1312,9 @@ async def _upsert(state, biz: Business, query: DiscoveryQuery) -> tuple[str, boo
             fill["domain"] = biz.domain
         if biz.phone and not existing.phone:
             fill["phone"] = biz.phone
-        if biz.kind and not existing.kind:
+        # Refresh classification. A brand pin stored as a producer, or a
+        # distribution center, has to be able to lose that kind.
+        if biz.kind != (existing.kind or ""):
             fill["kind"] = biz.kind
         if biz.latitude is not None and existing.latitude is None:
             fill["latitude"] = biz.latitude

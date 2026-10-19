@@ -506,10 +506,11 @@ async def test_overpass_throttling_is_an_error_not_an_empty_market(monkeypatch):
         return httpx.Response(504, text="")
 
     provider = D.OpenStreetMap()
-    with pytest.raises(RuntimeError, match="throttling"):
+    with pytest.raises(RuntimeError, match="throttling") as caught:
         async with _client(handler) as client:
             await provider.fetch(client, {}, D.DiscoveryQuery(
                 term="roofer", coordinate="39.7,-104.9,40"))
+    assert "roofer" in str(caught.value)
     assert seen == [
         endpoint
         for endpoint in D.OpenStreetMap.ENDPOINTS

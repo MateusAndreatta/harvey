@@ -11,7 +11,9 @@ The points are spread on purpose. A search already filtered by trade, so
 
 import re
 
-from harvey.brands import brand_key, is_manufacturer_name, is_reseller_name
+from harvey.brands import (
+    brand_key, is_distribution_name, is_manufacturer_name, is_reseller_name,
+)
 from harvey.places import haversine_km
 from harvey.textutil import fold
 
@@ -234,7 +236,9 @@ def score_company(company, config) -> tuple[int, str]:
     public_email = bool((getattr(company, "public_email", "") or "").strip())
     name = getattr(company, "name", "") or ""
     folded_name = fold(name)
-    producer = kind == "producer"
+    # A stored "producer" from an older run is still logistics when the
+    # name is a distribution center.
+    producer = kind == "producer" and not is_distribution_name(name)
     reseller = kind == "reseller" or is_reseller_name(name)
     traits = _trait_tokens(company)
     plant_name = bool(re.search(r"industri|fabrica", folded_name))

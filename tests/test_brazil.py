@@ -122,9 +122,18 @@ def test_osm_maps_brazilian_trades_without_catching_unrelated_terms():
         f"[out:json][timeout:{osm.QUERY_TIMEOUT_S}];"
     )
     assert osm._kind({"craft": "brewery"}, "Lúpulo") == "producer"
+    assert osm._kind({"craft": "brewery"}, "Lúpulo", "node") == "producer"
     assert osm._kind({"shop": "butcher"}, "Açougue") == "retail"
     assert osm._kind({"industrial": "factory"}, "Cosméticos ABC") == "producer"
+    assert osm._kind({"industrial": "factory"}, "Bosch", "node") == "producer"
+    assert osm._kind({"man_made": "works"}, "Bosch", "way") == "producer"
     assert osm._kind({"office": "company"}, "Indústria de Cosméticos") == "producer"
+    assert osm._kind({"man_made": "works"}, "Coca Cola", "node") != "producer"
+    assert osm._kind({"brand": "Coca-Cola"}, "Coca Cola", "node") != "producer"
+    assert osm._kind({"industrial": "warehouse"}, "Centro de Distribuição Coca Cola") != "producer"
+    assert osm._kind(
+        {"industrial": "factory"}, "Centro de Distribuição Ambev", "way",
+    ) != "producer"
     assert osm._kind({"shop": "cosmetics"}, "Consultora Mary Kay") == "reseller"
     assert osm._kind({"shop": "cosmetics"}, "Aqui tem Natura") == "reseller"
     assert osm._kind({"shop": "cosmetics"}, "O Boticário") == "reseller"
@@ -391,6 +400,19 @@ def test_score_company_reason_follows_language():
     assert "Rede" not in plant_reason
     assert "Produtor" in plant_reason
 
+    depot = Company(
+        name="Centro de Distribuição Ambev", industry="Indústria", city="Curitiba",
+        kind="producer", phone="(41) 3333-0106",
+    )
+    _, depot_reason = score_company(depot, HarveyConfig(**_payload(icp={
+        "industries": ["Indústria"],
+        "company_size": "médio",
+        "titles": ["Comprador"],
+        "geography": ["Curitiba, PR"],
+        "geo_coordinates": {"Curitiba, PR": "-25.4284,-49.2733,40"},
+    })))
+    assert "Produtor" not in depot_reason
+
 
 def test_example_yaml_is_a_lead_list_for_curitiba():
     cfg = load_config(str(EXAMPLE))
@@ -586,7 +608,10 @@ def test_print_shops_are_competitors_and_chains_have_a_brand_key():
     assert drop_thin_lead("ggg")
     assert is_junk("", "Cervejaria do Porto") is False
     assert drop_thin_lead("Ateliê de costura")
+    assert drop_thin_lead("Ateliê de costura", address="Rua das Flores, 10")
     assert drop_thin_lead("Ateliê de costura", phone="(41) 3333-0000") is False
+    assert drop_thin_lead("Ateliê de costur Iza klin")
+    assert drop_thin_lead("Ateliê de costur Iza klin", address="Rua 1")
     assert drop_thin_lead("SOS costura")
     assert drop_thin_lead("SOS costura", phone="(41) 3333-0000") is False
     assert drop_thin_lead("costura da silva") is False
@@ -822,14 +847,14 @@ async def test_cosmetics_resellers_drop_unless_the_icp_keeps_them(state):
 
 @pytest.mark.asyncio
 async def test_cursor_usage_records_before_the_brain_can_run_it(state):
-    from harvey.config import BRAIN_PROVIDERS as config_providers
-    from harvey.config import BrainConfig
+    """A cursor usage row records without asking BrainConfig.
+
+    PR #1 may add cursor to BrainConfig's provider list. This test only
+    checks the usage table, so that merge does not fail it.
+    """
     from harvey.state import BRAIN_PROVIDERS as state_providers
 
-    assert state_providers == ("claude", "codex", "cursor")
-    assert "cursor" not in config_providers
-    with pytest.raises(ValueError, match="cursor"):
-        BrainConfig(provider="cursor")
+    assert "cursor" in state_providers
     assert await state.record_usage_event(provider="cursor", output_tokens=3) is True
     with pytest.raises(ValueError):
         await state.record_usage_event(provider="gemini")
