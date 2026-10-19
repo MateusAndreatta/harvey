@@ -3,8 +3,8 @@
 #
 # Email sending is off on purpose: discover, profile, scout, and
 # `harvey export` do not need Gmail, SMTP, or any key in .env.
-# OpenStreetMap is free. Pure online stores are thin there — it maps
-# premises, and e-commerce falls back to wholesale shops.
+# OpenStreetMap is free and maps premises. A store that exists only
+# online is not in it, and "e-commerce" is not searched as wholesale.
 
 language: pt-BR
 
@@ -38,14 +38,13 @@ icp:
     - "Cervejarias"
     - "Vinícolas"
     - "Destilarias"
-    - "Alimentos"
+    - "Alimentos e bebidas"
     - "Padarias"
     - "Confeitarias"
     - "Cosméticos"
     - "Confecções"
     - "Farmácias de manipulação"
     - "Indústria"
-    - "E-commerce"
   company_size: "pequeno e médio"
   titles:
     - "Proprietário"
@@ -53,11 +52,14 @@ icp:
     - "Comprador"
     - "Gerente de compras"
   geography:
-    - "Curitiba, PR"
+    - "Curitiba e região metropolitana, PR"
     - "São Paulo, SP"
   # Keys must match geography exactly. lat,lng,radius_km.
+  # Towns inside the radius count as in-region, and a "região metropolitana"
+  # label also accepts that metro's municipalities.
+  # OSM does not search online-only stores. "E-commerce" is not an industry here.
   geo_coordinates:
-    "Curitiba, PR": "-25.4284,-49.2733,40"
+    "Curitiba e região metropolitana, PR": "-25.4284,-49.2733,40"
     "São Paulo, SP": "-23.5505,-46.6333,40"
   hiring_signals: []
 

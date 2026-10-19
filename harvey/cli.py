@@ -379,10 +379,14 @@ def cmd_export(args):
         out = args.out or "leads.csv"
         count, _ = await export_leads_csv(
             state, out_path=out, config=config, min_score=args.min_score,
+            one_per_brand=not args.branches,
         )
         print(f"\n  Exported {count} company lead(s) to {out}")
         print("  One row per company: segment, city, phone, site, ICP score,")
-        print("  and the best owner or buyer found (name, title, email).\n")
+        print("  and the best owner or buyer found (name, title, email).")
+        if not args.branches:
+            print("  Chain branches are one row per brand. Pass --branches to keep each.")
+        print()
 
     asyncio.run(_export())
 
@@ -775,6 +779,10 @@ def main():
     )
     sub.add_argument("--status", default="", help="Sequencer export: pipeline statuses (e.g. new,queued)")
     sub.add_argument("--all", action="store_true", help="Sequencer export of every prospect, no filters")
+    sub.add_argument(
+        "--branches", action="store_true",
+        help="Lead list: keep every chain branch instead of one row per brand",
+    )
     sub.set_defaults(func=cmd_export)
 
     sub = subparsers.add_parser(

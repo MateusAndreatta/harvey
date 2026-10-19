@@ -24,11 +24,13 @@ import asyncio
 import base64
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 import httpx
 
+from harvey.brands import brand_key, is_competitor_name
 from harvey.models import Company
 from harvey.textutil import fold
 
@@ -99,6 +101,8 @@ def is_junk(domain: str, name: str = "") -> bool:
         if "." not in domain or re.fullmatch(r"[\d.]+", domain):
             return True
     if name and any(p.search(name) for p in JUNK_NAME_PATTERNS):
+        return True
+    if name and is_competitor_name(name):
         return True
     return False
 
@@ -196,6 +200,12 @@ class Business:
     external_id: str = ""            # "<provider>:<stable id>"
     source_url: str = ""
     provider: str = ""
+    # Chain key, coordinates, and producer/retail/competitor. Empty brand
+    # means an independent business and is not collapsed.
+    brand: str = ""
+    latitude: float | None = None
+    longitude: float | None = None
+    kind: str = ""
 
     def identity(self) -> str:
         return self.domain or self.external_id
@@ -489,9 +499,25 @@ class OpenStreetMap(DiscoveryProvider):
     BACKOFF = 5.0
 
     # A friendly term maps to the OSM tags that actually carry those businesses.
-    # Keys are accent-folded stems. The first match wins, so the original
-    # trades stay above newer ones: "cosmetic dentist" must still hit
-    # dentist, not a cosmetics shop. There is no catch-all entry.
+    # Keys are accent-folded stems. One industry may match several stems
+    # ("alimentos e bebidas" is food producers and drink producers). The
+    # original trades stay exclusive: "cosmetic dentist" is a dentist, not
+    # a cosmetics shop. There is no catch-all entry.
+    #
+    # A spec is "key=value" or "key=value|name~regex". Producer tags
+    # (craft, industrial, man_made) are kept ahead of retail shops.
+    _EXCLUSIVE = (
+        "dentist", "lawyer", "attorney", "roof", "plumb", "hvac",
+        "electric", "contractor", "landscap",
+    )
+    # Retail shops dropped when the same query already has a producer tag.
+    # Bakeries and confectioners live as shop=* in OSM, so those stay.
+    _RETAIL_IF_PRODUCER = frozenset({
+        "shop=butcher", "shop=greengrocer", "shop=deli", "shop=dairy",
+        "shop=seafood", "shop=farm", "shop=supermarket", "shop=convenience",
+        "shop=wholesale", "shop=clothes", "shop=cosmetics", "shop=perfumery",
+        "shop=chemist", "shop=pharmacy",
+    })
     TAG_MAP = {
         "roof": ["craft=roofer", "shop=roofing"],
         "plumb": ["craft=plumber"],
@@ -519,18 +545,24 @@ class OpenStreetMap(DiscoveryProvider):
         "padaria": ["shop=bakery"],
         "panific": ["shop=bakery"],
         "baker": ["shop=bakery"],
+        # Producers, not the butcher and the greengrocer. "alimentos e
+        # bebidas" also matches the drink stems below and the tags are unioned.
         "alimento": [
-            "shop=butcher", "shop=greengrocer", "shop=deli", "shop=dairy",
-            "shop=seafood", "shop=farm", "craft=cheese",
+            "craft=bakery", "craft=confectionery", "craft=cheese",
+            "craft=coffee_roaster",
         ],
         "food": [
-            "shop=butcher", "shop=greengrocer", "shop=deli", "shop=dairy",
-            "shop=seafood", "shop=farm", "craft=cheese",
+            "craft=bakery", "craft=confectionery", "craft=cheese",
+            "craft=coffee_roaster",
         ],
+        "bebida": ["craft=brewery", "craft=winery", "craft=distillery"],
+        "beverage": ["craft=brewery", "craft=winery", "craft=distillery"],
         # Cosmetics, clothing, pharmacy. "cosmet" is after "dentist" above.
         "cosmet": ["shop=cosmetics", "shop=perfumery"],
         "perfum": ["shop=cosmetics", "shop=perfumery"],
-        "confecc": ["shop=clothes", "craft=tailor", "craft=dressmaker"],
+        # Manufacturers, not the C&A. A search that only says "clothes" or
+        # "roupa" still uses the retail tag below.
+        "confecc": ["craft=tailor", "craft=dressmaker"],
         "vestuar": ["shop=clothes"],
         "alfaiat": ["craft=tailor"],
         "costur": ["craft=tailor"],
@@ -539,16 +571,14 @@ class OpenStreetMap(DiscoveryProvider):
         "cloth": ["shop=clothes"],
         "apparel": ["shop=clothes"],
         "roupa": ["shop=clothes"],
-        "manipula": ["shop=chemist", "shop=pharmacy", "amenity=pharmacy"],
+        # "manipula" is handled on its own (name filter) so a compounding
+        # pharmacy search does not return every Droga Raia.
         "drogaria": ["shop=chemist", "shop=pharmacy", "amenity=pharmacy"],
         "farmac": ["shop=chemist", "shop=pharmacy", "amenity=pharmacy"],
         "pharmac": ["shop=chemist", "shop=pharmacy", "amenity=pharmacy"],
         "chemist": ["shop=chemist", "amenity=pharmacy"],
-        # Physical premises only. Pure online stores are thin on OSM;
-        # wholesale is the closest mapped stand-in, not a catch-all office.
-        "ecommerce": ["shop=wholesale"],
-        "comercio eletronico": ["shop=wholesale"],
-        "loja virtual": ["shop=wholesale"],
+        # Wholesale is a real shop type. Online-only stores are not: mapping
+        # "e-commerce" here returned Sam's Club. Those terms stay unmapped.
         "atacad": ["shop=wholesale"],
         "wholesale": ["shop=wholesale"],
         "fabrica": ["industrial=factory", "man_made=works"],
@@ -566,10 +596,10 @@ class OpenStreetMap(DiscoveryProvider):
         "contractor", "landscaping",
         "brewery", "cervejaria", "winery", "vinícola", "distillery", "destilaria",
         "bakery", "padaria", "confectionery", "confeitaria",
-        "food", "alimentos", "cosmetics", "cosméticos",
+        "food", "alimentos", "bebidas", "cosmetics", "cosméticos",
         "clothes", "confecção", "tailor", "alfaiate",
         "pharmacy", "farmácia", "chemist", "manipulação",
-        "factory", "indústria", "e-commerce", "atacado",
+        "factory", "indústria", "atacado",
     )
 
     def _tags(self, term: str) -> list[str]:
@@ -583,13 +613,47 @@ class OpenStreetMap(DiscoveryProvider):
         nothing.
 
         Matching ignores accents and hyphens, so "vinícola" and "vinicola"
-        hit the same tags. The first stem in ``TAG_MAP`` wins.
+        hit the same tags. A compound industry unions every stem it contains
+        ("alimentos e bebidas" is breweries and food producers, not only the
+        first word). Exclusive trades still win alone, so "cosmetic dentist"
+        stays a dentist. When a producer tag is in the set, generic retail
+        shops are dropped.
         """
         folded = fold(term)
+        if not folded:
+            return []
+        # Compounding pharmacies are a name match, not every pharmacy chain.
+        if "manipula" in folded:
+            return [
+                "amenity=pharmacy|name~manipula",
+                "shop=chemist|name~manipula",
+            ]
+        exclusive = [needle for needle in self._EXCLUSIVE if needle in folded]
+        if exclusive:
+            for needle in self.TAG_MAP:
+                if needle in exclusive:
+                    return list(self.TAG_MAP[needle])
+        found: list[str] = []
+        seen: set[str] = set()
         for needle, tags in self.TAG_MAP.items():
-            if needle in folded:
-                return tags
-        return []
+            if needle not in folded:
+                continue
+            for tag in tags:
+                if tag not in seen:
+                    seen.add(tag)
+                    found.append(tag)
+        return self._prefer_producers(found)
+
+    @classmethod
+    def _prefer_producers(cls, tags: list[str]) -> list[str]:
+        """Drop generic retail when the query already names a producer."""
+        producer = any(
+            tag.startswith(("craft=", "industrial=", "man_made="))
+            for tag in tags
+        )
+        if not producer:
+            return tags
+        return [tag for tag in tags if tag.split("|", 1)[0] not in cls._RETAIL_IF_PRODUCER]
 
     async def fetch(self, client, env, query):
         if not query.coordinate:
@@ -604,12 +668,14 @@ class OpenStreetMap(DiscoveryProvider):
                 f"listings or SERP provider for anything else.")
         lat, lng, radius_km = (query.coordinate.split(",") + ["", "", ""])[:3]
         radius_m = int(float(radius_km or 25) * 1000)
+        # One nwr (node/way/relation) per tag, and only elements that have a
+        # name. The old query asked for node and way separately and then
+        # threw away the unnamed ones, which is most of the time Overpass spent.
         clauses = "".join(
-            f'node[{tag.split("=")[0]}={tag.split("=")[1]}](around:{radius_m},{lat},{lng});'
-            f'way[{tag.split("=")[0]}={tag.split("=")[1]}](around:{radius_m},{lat},{lng});'
-            for tag in tags
+            self._overpass_clause(tag, radius_m, lat, lng) for tag in tags
         )
-        body = f"[out:json][timeout:40];({clauses});out center {query.limit};"
+        body = f"[out:json][timeout:25];({clauses});out center {query.limit};"
+        started = time.monotonic()
 
         # Overpass is a free volunteer service and 429s/504s readily under
         # load. Walk the mirrors, then RAISE: returning [] would make a
@@ -645,6 +711,13 @@ class OpenStreetMap(DiscoveryProvider):
             name = tags.get("name") or ""
             if not name:
                 continue
+            kind = self._kind(tags, name)
+            center = el.get("center") or {}
+            try:
+                plat = float(el.get("lat") or center.get("lat"))
+                plon = float(el.get("lon") or center.get("lon"))
+            except (TypeError, ValueError):
+                plat, plon = None, None
             site = tags.get("website") or tags.get("contact:website") or ""
             city_name = tags.get("addr:city") or ""
             state_name = tags.get("addr:state") or ""
@@ -666,8 +739,44 @@ class OpenStreetMap(DiscoveryProvider):
                 external_id=f"osm:{el.get('type')}/{el.get('id')}",
                 source_url=f"https://www.openstreetmap.org/{el.get('type')}/{el.get('id')}",
                 provider=self.key,
+                brand=brand_key(
+                    name, tags.get("brand") or "", tags.get("brand:wikidata") or "",
+                ),
+                latitude=plat,
+                longitude=plon,
+                kind=kind,
             ))
+        logger.info(
+            "osm: %s — %d named places in %.1fs",
+            query.keyword(), len(out), time.monotonic() - started,
+        )
         return out
+
+    @staticmethod
+    def _overpass_clause(spec: str, radius_m: int, lat: str, lng: str) -> str:
+        body, _, name_rx = spec.partition("|name~")
+        key, _, value = body.partition("=")
+        # A name regex already requires a name. Otherwise ask Overpass to
+        # skip unnamed elements instead of downloading them.
+        name_filter = f'["name"~"{name_rx}",i]' if name_rx else '["name"]'
+        return (
+            f'nwr["{key}"="{value}"]{name_filter}'
+            f"(around:{radius_m},{lat},{lng});"
+        )
+
+    @staticmethod
+    def _kind(tags: dict, name: str) -> str:
+        if is_competitor_name(name) or tags.get("craft") in ("printer", "printmaker"):
+            return "competitor"
+        if tags.get("shop") in ("copyshop", "printer"):
+            return "competitor"
+        if tags.get("craft") or tags.get("industrial") or tags.get("man_made") in (
+            "works", "factory",
+        ):
+            return "producer"
+        if tags.get("shop") or tags.get("amenity"):
+            return "retail"
+        return ""
 
 
 PROVIDERS: dict[str, DiscoveryProvider] = {
@@ -856,10 +965,12 @@ async def run_discovery(
                 report.found += len(found)
                 batch = []
                 for biz in found:
-                    if is_junk(biz.domain, biz.name):
+                    if is_junk(biz.domain, biz.name) or biz.kind == "competitor":
                         report.junk += 1
                         continue
-                    ident = biz.identity()
+                    # One row per chain. The brand key is stable across
+                    # branches that have no website and therefore no domain.
+                    ident = biz.brand or biz.identity()
                     if not ident or ident in seen:
                         continue
                     seen.add(ident)
@@ -895,11 +1006,25 @@ async def _upsert(state, biz: Business, query: DiscoveryQuery) -> tuple[str, boo
     # Look before inserting, so "already knew this one" is a fact we report
     # rather than something inferred from an insert's return value.
     existing = None
-    if biz.domain:
+    if biz.brand:
+        existing = await state.get_company_by_brand(biz.brand)
+    if existing is None and biz.domain:
         existing = await state.get_company_by_domain(biz.domain)
     if existing is None and biz.external_id:
         existing = await state.get_company_by_external_id(biz.external_id)
     if existing:
+        fill = {}
+        if biz.website and not existing.website:
+            fill["website"] = biz.website
+        if biz.phone and not existing.phone:
+            fill["phone"] = biz.phone
+        if biz.kind and not existing.kind:
+            fill["kind"] = biz.kind
+        if biz.latitude is not None and existing.latitude is None:
+            fill["latitude"] = biz.latitude
+            fill["longitude"] = biz.longitude
+        if fill:
+            await state.update_company_lead(existing.id, **fill)
         return existing.id, False
 
     place = biz.location or query.location
@@ -917,6 +1042,10 @@ async def _upsert(state, biz: Business, query: DiscoveryQuery) -> tuple[str, boo
         source=f"discover:{biz.provider}",
         source_url=biz.source_url,
         external_id=biz.external_id,
+        brand=biz.brand,
+        latitude=biz.latitude,
+        longitude=biz.longitude,
+        kind=biz.kind,
     )
     return await state.add_company(company), True
 

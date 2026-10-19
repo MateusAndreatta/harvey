@@ -4,9 +4,41 @@ Scoring here is deterministic. A lead-list run must work with no mailbox
 and no model call: the reason in the CSV is a template, not a generated
 email. Portuguese is a short phrase swap, not a translation of the
 copywriting prompts.
+
+The points are spread on purpose. A search already filtered by trade, so
+"segment matches" cannot be most of the score or every row lands on 90.
 """
 
+import math
+
+from harvey.brands import brand_key
 from harvey.textutil import fold
+
+# Official Região Metropolitana de Curitiba, and the main municípios of the
+# RMSP. Used when the geography label says "região metropolitana" and the
+# row has no coordinates of its own. A plain "Curitiba, PR" does not expand
+# to the whole metro; the radius does that when the row has a lat/lon.
+CURITIBA_METRO = frozenset(fold(name) for name in (
+    "Adrianópolis", "Agudos do Sul", "Almirante Tamandaré", "Araucária",
+    "Balsa Nova", "Bocaiúva do Sul", "Campina Grande do Sul", "Campo Largo",
+    "Campo Magro", "Campo do Tenente", "Cerro Azul", "Colombo", "Contenda",
+    "Curitiba", "Doutor Ulysses", "Fazenda Rio Grande", "Itaperuçu", "Lapa",
+    "Mandirituba", "Piên", "Pinhais", "Piraquara", "Quatro Barras",
+    "Quitandinha", "Rio Branco do Sul", "Rio Negro", "São José dos Pinhais",
+    "Tijucas do Sul", "Tunas do Paraná",
+))
+
+SAO_PAULO_METRO = frozenset(fold(name) for name in (
+    "São Paulo", "Guarulhos", "São Bernardo do Campo", "Santo André",
+    "Osasco", "São Caetano do Sul", "Mauá", "Diadema", "Carapicuíba",
+    "Mogi das Cruzes", "Itaquaquecetuba", "Taboão da Serra", "Barueri",
+    "Embu das Artes", "Cotia", "Santana de Parnaíba", "Ferraz de Vasconcelos",
+    "Francisco Morato", "Itapevi", "Suzano", "Ribeirão Pires", "Caieiras",
+    "Franco da Rocha", "Poá", "Arujá", "Mairiporã", "Jandira",
+    "Itapecerica da Serra", "Rio Grande da Serra", "Vargem Grande Paulista",
+    "Cajamar", "Santa Isabel", "Embu-Guaçu", "Biritiba Mirim", "Guararema",
+    "Salesópolis", "Juquitiba", "Pirapora do Bom Jesus", "São Lourenço da Serra",
+))
 
 # Same seat, different language. A page that says "proprietário" matches
 # an ICP title of "owner", and the other way around.
@@ -74,6 +106,87 @@ def pick_best_contact(prospects: list) -> object | None:
     return max(prospects, key=key)
 
 
+def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    radius = 6371.0
+    p1, p2 = math.radians(lat1), math.radians(lat2)
+    dphi = math.radians(lat2 - lat1)
+    dlmb = math.radians(lon2 - lon1)
+    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2) ** 2
+    return 2 * radius * math.asin(min(1.0, math.sqrt(a)))
+
+
+def _parse_coordinate(raw: str) -> tuple[float, float, float] | None:
+    parts = [p.strip() for p in (raw or "").split(",")]
+    if len(parts) < 2:
+        return None
+    try:
+        lat, lon = float(parts[0]), float(parts[1])
+        radius = float(parts[2]) if len(parts) > 2 and parts[2] else 40.0
+    except ValueError:
+        return None
+    return lat, lon, radius
+
+
+def _metro_towns(label: str) -> frozenset[str] | None:
+    folded = fold(label)
+    if "metropolit" not in folded and "grande " not in folded and folded not in ("rmc", "rmsp"):
+        return None
+    if "curitiba" in folded or folded == "rmc":
+        return CURITIBA_METRO
+    if "sao paulo" in folded or folded == "rmsp":
+        return SAO_PAULO_METRO
+    return None
+
+
+def _text_geo(where: str, places: list[str]) -> bool:
+    folded_where = fold(where)
+    if not folded_where:
+        return False
+    return any(
+        fold(item) and (fold(item) in folded_where or folded_where in fold(item))
+        for item in places
+    )
+
+
+def in_target_region(company, config) -> bool:
+    """True when the business sits in a configured geography.
+
+    A radius wins when the row has coordinates: São José dos Pinhais is in
+    range of Curitiba even though the names do not match. A geography label
+    that says "região metropolitana" also accepts the known towns of that
+    metro, which covers rows saved before coordinates were stored. The old
+    text comparison remains for labels like "Curitiba, PR".
+    """
+    icp = getattr(config, "icp", None)
+    places = list(getattr(icp, "geography", None) or [])
+    coords = dict(getattr(icp, "geo_coordinates", None) or {})
+    city = (getattr(company, "city", "") or "").strip()
+    location = (getattr(company, "location", "") or "").strip()
+    where = city or location
+
+    lat = getattr(company, "latitude", None)
+    lon = getattr(company, "longitude", None)
+    if lat is not None and lon is not None and coords:
+        for raw in coords.values():
+            point = _parse_coordinate(str(raw))
+            if point and _haversine_km(float(lat), float(lon), point[0], point[1]) <= point[2]:
+                return True
+
+    folded_city = fold(city or where.split(",")[0])
+    for label in list(places) + list(coords):
+        towns = _metro_towns(str(label))
+        if towns and folded_city in towns:
+            return True
+
+    return _text_geo(where, places) or _text_geo(where, list(coords))
+
+
+def _is_chain(company) -> bool:
+    if (getattr(company, "brand", "") or "").strip():
+        return True
+    return bool(brand_key(getattr(company, "name", "") or ""))
+
+
 def score_company(company, config) -> tuple[int, str]:
     """Return (1-100, short reason) for one discovered business.
 
@@ -90,29 +203,40 @@ def score_company(company, config) -> tuple[int, str]:
     location = (getattr(company, "location", "") or "").strip()
     where = city or location
     folded_industry = fold(industry)
-    folded_where = fold(where)
+    kind = (getattr(company, "kind", "") or "").strip().lower()
 
     industry_hit = bool(folded_industry) and any(
         fold(item) and (fold(item) in folded_industry or folded_industry in fold(item))
         for item in industries
     )
-    geo_hit = bool(folded_where) and any(
-        fold(item) and (fold(item) in folded_where or folded_where in fold(item))
-        for item in places
-    )
-    reachable = bool(
-        (getattr(company, "phone", "") or "").strip()
-        or (getattr(company, "website", "") or "").strip()
+    geo_hit = in_target_region(company, config) if (places or getattr(icp, "geo_coordinates", None)) else False
+    chain = _is_chain(company)
+    website = bool(
+        (getattr(company, "website", "") or "").strip()
         or (getattr(company, "domain", "") or "").strip()
     )
+    phone = bool((getattr(company, "phone", "") or "").strip())
+    public_email = bool((getattr(company, "public_email", "") or "").strip())
+    producer = kind == "producer"
+    retail = kind == "retail" or (chain and not producer)
 
-    score = 35
+    score = 8
     if industry_hit:
-        score += 35
+        score += 12
     if geo_hit:
-        score += 20
-    if reachable:
-        score += 10
+        score += 18
+    if producer:
+        score += 22
+    elif retail:
+        score += 4
+    if chain:
+        score -= 18
+    if website:
+        score += 14
+    if phone:
+        score += 8
+    if public_email:
+        score += 6
     score = max(1, min(100, score))
 
     if portuguese:
@@ -122,11 +246,21 @@ def score_company(company, config) -> tuple[int, str]:
         elif industries:
             parts.append("Segmento fora do ICP configurado.")
         if geo_hit:
-            parts.append(f"Na região alvo ({where}).")
+            parts.append(f"Na região alvo ({where})." if where else "Na região alvo.")
         elif places:
             parts.append("Fora da região alvo.")
-        if reachable:
-            parts.append("Tem telefone ou site para contato.")
+        if producer:
+            parts.append("Produtor, não só ponto de varejo.")
+        elif retail:
+            parts.append("Varejo.")
+        if chain:
+            parts.append("Rede: filiais contam como uma marca.")
+        if website:
+            parts.append("Tem site.")
+        if phone:
+            parts.append("Tem telefone.")
+        if public_email:
+            parts.append("Tem e-mail publicado.")
         if not parts:
             parts.append("Sem dados de segmento para comparar com o ICP.")
     else:
@@ -136,11 +270,21 @@ def score_company(company, config) -> tuple[int, str]:
         elif industries:
             parts.append("Segment is outside the configured ICP.")
         if geo_hit:
-            parts.append(f"In the target geography ({where}).")
+            parts.append(f"In the target geography ({where})." if where else "In the target geography.")
         elif places:
             parts.append("Outside the target geography.")
-        if reachable:
-            parts.append("Has a phone or a website.")
+        if producer:
+            parts.append("Producer, not only a retail counter.")
+        elif retail:
+            parts.append("Retail.")
+        if chain:
+            parts.append("Chain: branches count as one brand.")
+        if website:
+            parts.append("Has a website.")
+        if phone:
+            parts.append("Has a phone.")
+        if public_email:
+            parts.append("Has a published email.")
         if not parts:
             parts.append("No segment to compare with the ICP.")
 

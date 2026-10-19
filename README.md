@@ -438,13 +438,15 @@ harvey scout             # ICP score and owner/buyer from the pages already read
 harvey export            # leads.csv
 ```
 
-`leads.csv` has one row per company: name, segment, city, address, phone, website, ICP score and reason, and the best owner or purchasing contact (name, title, email, email confidence). A company with no email is still a row. An inbox copied off the site (`contato@`) is marked `published`, not verified. `harvey export --deliverable` is the older sequencer file (verified and risky emails only).
+`leads.csv` has one row per company: name, segment, city, address, phone, website, ICP score and reason, and the best owner or purchasing contact (name, title, email, email confidence). A company with no email is still a row. An inbox copied off the site (`contato@`) is marked `published`, not verified. Chain branches (Droga Raia, O Boticário, C&A, and the other national brands) collapse to one row; `harvey export --branches` keeps every address. Gráficas and label shops are left out. `harvey export --deliverable` is the older sequencer file (verified and risky emails only).
 
-`language: pt-BR` writes the score reason and the Signals tab in Brazilian Portuguese. Email prompt files stay as they are; this path does not send them. `compliance.regime: br` is the LGPD note (legitimate interest for role-relevant B2B contact, sender identification, a clear descadastro) for the day sending is turned on. Descadastro wording is honored either way.
+The score is not a flat "in the search". Producers rank above retail, a website and a phone each add points, and a chain is penalized, so the list is not a pile of 90s.
 
-OpenStreetMap understands the trade words in that example (cervejaria, vinícola, padaria, confecção, farmácia de manipulação, and the English equivalents), accents ignored. It maps premises. A brewery with a taproom shows up; a store that exists only online usually does not. E-commerce is matched to wholesale shops, which is a thin stand-in, not a directory of lojas virtuais. For a denser local list, `harvey discover --providers` shows the paid sources.
+`language: pt-BR` writes the score reason and the Signals tab in Brazilian Portuguese. Email prompt files stay as they are; this path does not send them. `compliance.regime: br` is the LGPD note (legitimate interest for role-relevant B2B contact, sender identification, a clear descadastro) for the day sending is turned on. Descadastro wording is honored either way. `harvey train` rewrites the product sections and leaves ICP, language, compliance, channels, and quiet-hours timezone alone when those are already filled in.
 
-The geography keys must match `icp.geo_coordinates` exactly (`"Curitiba, PR"`, not `Curitiba`). The example uses a 40 km radius around Curitiba and São Paulo.
+OpenStreetMap understands the trade words in that example (cervejaria, vinícola, padaria, confecção, farmácia de manipulação, and the English equivalents), accents ignored. A compound industry uses every matching tag, and producer tags (`craft`, `industrial`) win over retail shops: "alimentos e bebidas" is breweries, wineries, distilleries, and food producers, not butchers. "Farmácia de manipulação" asks Overpass for pharmacies whose name says manipulação, not every Droga Raia. It maps premises. A brewery with a taproom shows up; a store that exists only online does not, and "e-commerce" is not searched (that used to return wholesale clubs). Each industry is one Overpass request (`nwr`, named elements only). For a denser local list, `harvey discover --providers` shows the paid sources.
+
+A business is in the target region when it sits inside a `geo_coordinates` radius, or when the geography label says "região metropolitana" and the city is one of that metro's municipalities (São José dos Pinhais and Colombo count for Curitiba). The keys must still match exactly. The example uses a 40 km radius around Curitiba's metro and São Paulo.
 
 ---
 

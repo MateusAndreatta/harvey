@@ -11,9 +11,11 @@ import pytest_asyncio
 from harvey.agents.handler import is_opt_out
 from harvey.agents.scout import Scout
 from harvey.agents.writer import Writer
+from harvey.brands import brand_key, is_competitor_name
 from harvey.collectors.discover import (
-    Business, DiscoveryQuery, OpenStreetMap, _upsert, build_queries,
+    Business, DiscoveryQuery, OpenStreetMap, _upsert, build_queries, is_junk,
 )
+from harvey.trainer import preserve_operator_settings
 from harvey.collectors.profile import (
     CAREERS_PATHS, CONTACT_PATHS, TEAM_PATHS,
     extract_published_contacts, people_from_html, title_looks_like_role,
@@ -85,14 +87,33 @@ def test_osm_maps_brazilian_trades_without_catching_unrelated_terms():
     assert osm._tags("Confeitarias") == [
         "craft=confectionery", "shop=confectionery", "shop=pastry",
     ]
-    assert osm._tags("Alimentos")[0] == "shop=butcher"
+    alimentos = osm._tags("alimentos e bebidas")
+    assert "craft=brewery" in alimentos
+    assert "craft=winery" in alimentos
+    assert "craft=distillery" in alimentos
+    assert "craft=bakery" in alimentos
+    assert "shop=butcher" not in alimentos
     assert osm._tags("Cosméticos") == ["shop=cosmetics", "shop=perfumery"]
-    assert osm._tags("Confecções") == ["shop=clothes", "craft=tailor", "craft=dressmaker"]
+    assert osm._tags("Confecções") == ["craft=tailor", "craft=dressmaker"]
     assert osm._tags("Farmácias de manipulação") == [
-        "shop=chemist", "shop=pharmacy", "amenity=pharmacy",
+        "amenity=pharmacy|name~manipula",
+        "shop=chemist|name~manipula",
     ]
+    assert "amenity=pharmacy" in osm._tags("Farmácia")
     assert osm._tags("Indústria") == ["industrial=factory", "man_made=works"]
-    assert osm._tags("E-commerce") == ["shop=wholesale"]
+    assert osm._tags("E-commerce") == []
+    brewery = osm._overpass_clause("craft=brewery", 1000, "1", "2")
+    assert "nwr[" in brewery
+    assert "node[" not in brewery
+    assert '["name"]' in brewery
+    manipula = osm._overpass_clause(
+        "amenity=pharmacy|name~manipula", 1000, "1", "2",
+    )
+    assert '["name"~"manipula",i]' in manipula
+    assert osm._kind({"craft": "brewery"}, "Lúpulo") == "producer"
+    assert osm._kind({"shop": "butcher"}, "Açougue") == "retail"
+    assert osm._kind({"craft": "printer"}, "Oficina") == "competitor"
+    assert osm._kind({"shop": "copyshop"}, "Cópias") == "competitor"
     # First match still wins: dentist is mapped ahead of cosmetics.
     assert osm._tags("cosmetic dentist") == ["amenity=dentist"]
     assert osm._tags("B2B SaaS") == []
@@ -180,13 +201,61 @@ def test_score_company_reason_follows_language():
         phone="(41) 3333-0000", location="Curitiba, PR",
     )
     score, reason = score_company(company, HarveyConfig(**_payload()))
-    assert score == 100
     assert "Segmento compatível" in reason
+    assert "Na região alvo" in reason
     assert "Curitiba" in reason
 
     english = HarveyConfig(**_payload(language="en"))
     _, en_reason = score_company(company, english)
     assert "Segment matches" in en_reason
+
+    producer = Company(
+        name="Lúpulo", industry="Cervejarias", city="Curitiba",
+        phone="(41) 3333-0000", website="https://lupulo.example",
+        kind="producer",
+    )
+    chain = Company(
+        name="Droga Raia", industry="Farmácias de manipulação", city="Curitiba",
+        phone="(41) 3333-0001", kind="retail",
+    )
+    producer_score, _ = score_company(producer, HarveyConfig(**_payload()))
+    chain_score, chain_reason = score_company(chain, HarveyConfig(**_payload()))
+    assert producer_score >= chain_score + 30
+    assert "Produtor" in score_company(producer, HarveyConfig(**_payload()))[1]
+    assert "Rede" in chain_reason
+
+    suburb = Company(
+        name="Cervejaria do Porto", industry="Cervejarias",
+        city="São José dos Pinhais", kind="producer", phone="(41) 3333-0002",
+    )
+    metro = HarveyConfig(**_payload(
+        icp={
+            "industries": ["Cervejarias"],
+            "company_size": "pequeno",
+            "titles": ["Proprietário"],
+            "geography": ["Curitiba e região metropolitana, PR"],
+            "geo_coordinates": {
+                "Curitiba e região metropolitana, PR": "-25.4284,-49.2733,40",
+            },
+        },
+    ))
+    _, suburb_reason = score_company(suburb, metro)
+    assert "Na região alvo" in suburb_reason
+    assert "Fora da região" not in suburb_reason
+
+    nearby = Company(
+        name="Cervejaria Colombo", industry="Cervejarias", city="Colombo",
+        kind="producer", latitude=-25.29, longitude=-49.22,
+    )
+    _, nearby_reason = score_company(nearby, HarveyConfig(**_payload()))
+    assert "Na região alvo" in nearby_reason
+
+    far = Company(
+        name="Cervejaria Londrina", industry="Cervejarias", city="Londrina",
+        kind="producer",
+    )
+    _, far_reason = score_company(far, metro)
+    assert "Fora da região alvo" in far_reason
 
 
 def test_example_yaml_is_a_lead_list_for_curitiba():
@@ -197,10 +266,10 @@ def test_example_yaml_is_a_lead_list_for_curitiba():
     queries = build_queries(cfg)
     match = [
         q for q in queries
-        if q.term == "Cervejarias" and q.location == "Curitiba, PR"
+        if q.term == "Cervejarias" and "Curitiba" in q.location
     ]
     assert match and match[0].coordinate.startswith("-25.4284")
-    assert len(queries) == 22
+    assert len(queries) == 20
 
 
 def test_signal_codes_stay_put_when_labels_switch():
@@ -269,7 +338,11 @@ async def test_lead_csv_includes_companies_without_email(state, tmp_path):
     assert by_name["Sem E-mail"]["segment"] == "Cervejarias"
     assert by_name["Sem E-mail"]["city"] == "Curitiba"
     assert by_name["Sem E-mail"]["phone"] == "(41) 1111-1111"
-    assert int(by_name["Sem E-mail"]["icp_score"]) >= 90
+    # A phone-only match used to land on 90 with every other row. The
+    # spread keeps it well under that, and a website still ranks higher.
+    bare_score = int(by_name["Sem E-mail"]["icp_score"])
+    assert 30 <= bare_score < 90
+    assert int(by_name["Com Comprador"]["icp_score"]) > bare_score
     assert by_name["Contato Publicado"]["email_confidence"] == "published"
     assert by_name["Contato Publicado"]["contact_email"] == "contato@publicado.com.br"
     # Owner/buyer with an email wins over a higher score that is neither.
@@ -314,7 +387,7 @@ async def test_scout_scores_profile_contacts_without_a_mailbox(state, monkeypatc
     assert cycle["profiled"] == 0
 
     company = await state.get_company(cid)
-    assert company.icp_score >= 90
+    assert 40 <= company.icp_score < 90
     assert "Contato: João da Silva" in company.icp_reason
     prospects = await state.list_prospects()
     assert len(prospects) == 1
@@ -358,3 +431,164 @@ async def test_dashboard_does_not_require_a_mailbox_for_lead_lists(monkeypatch):
     assert "lead lists" in by_id["email_provider"]["label"]
     assert by_id["verifier"]["required"] is False
     assert by_id["env_file"]["required"] is False
+
+
+def test_print_shops_are_competitors_and_chains_have_a_brand_key():
+    assert is_junk("", "Fotolaser Gráfica")
+    assert is_junk("lamigraf.com.br", "Lamigraf")
+    assert is_competitor_name("Rótulos & Etiquetas")
+    assert is_junk("", "Cervejaria do Porto") is False
+    assert brand_key("Droga Raia Batel") == "chain:droga raia"
+    assert brand_key("O Boticário Shopping") == "chain:o boticario"
+    assert brand_key("C&A Palladium") == "chain:c&a"
+    assert brand_key("Cervejaria do Porto") == ""
+    assert brand_key("Filial Norte", brand="Nissei") == "brand:nissei"
+    assert brand_key("Loja 3", wikidata="Q123") == "wd:Q123"
+
+
+@pytest.mark.asyncio
+async def test_chain_branches_collapse_and_competitors_drop_out(state):
+    cfg = HarveyConfig(**_payload())
+    first, was_new = await _upsert(
+        state,
+        Business(
+            name="Droga Raia Centro", location="Curitiba, PR",
+            external_id="osm:node/1", provider="osm", brand="chain:droga raia",
+        ),
+        DiscoveryQuery(term="Farmácia", location="Curitiba, PR"),
+    )
+    second, again = await _upsert(
+        state,
+        Business(
+            name="Droga Raia Batel", phone="(41) 3000-0000",
+            location="Curitiba, PR", external_id="osm:node/2", provider="osm",
+            brand="chain:droga raia",
+        ),
+        DiscoveryQuery(term="Farmácia", location="Curitiba, PR"),
+    )
+    assert was_new and not again
+    assert first == second
+    saved = await state.get_company(first)
+    assert saved.phone == "(41) 3000-0000"
+    assert saved.brand == "chain:droga raia"
+
+    await state.add_company(Company(
+        name="O Boticário Shopping", city="Curitiba", external_id="osm:node/3",
+    ))
+    await state.add_company(Company(
+        name="O Boticário Centro", city="Curitiba", phone="(41) 9",
+        external_id="osm:node/4",
+    ))
+    await state.add_company(Company(
+        name="Cervejaria do Porto", industry="Cervejarias", city="Curitiba",
+        external_id="osm:node/5",
+    ))
+    await state.add_company(Company(
+        name="Fotolaser Gráfica", city="Curitiba", external_id="osm:node/6",
+    ))
+
+    rows = await collect_leads(state, config=cfg)
+    names = {row["company_name"] for row in rows}
+    assert "Fotolaser Gráfica" not in names
+    assert "Cervejaria do Porto" in names
+    boticario = [row for row in rows if "Botic" in row["company_name"]]
+    assert len(boticario) == 1
+    assert "2 filiais agrupadas" in boticario[0]["icp_reason"]
+
+    every_branch = await collect_leads(state, config=cfg, one_per_brand=False)
+    assert sum("Botic" in row["company_name"] for row in every_branch) == 2
+
+
+@pytest.mark.asyncio
+async def test_v13_upgrades_a_database_that_already_applied_the_draft_v12(tmp_path):
+    """PR #1 owns v12 (cursor_calls). A live DB may already be at the draft
+    v12 that added the lead columns, so v13 must skip those and still add
+    the Cursor counter."""
+    import aiosqlite
+
+    from harvey.state import MIGRATIONS
+
+    assert len(MIGRATIONS) == 13
+    db_path = str(tmp_path / "draft.db")
+    async with aiosqlite.connect(db_path) as db:
+        for script in MIGRATIONS[:11]:
+            await db.executescript(script)
+        for column, typedef in (
+            ("address", "TEXT DEFAULT ''"),
+            ("city", "TEXT DEFAULT ''"),
+            ("public_email", "TEXT DEFAULT ''"),
+            ("icp_score", "INTEGER DEFAULT 0"),
+            ("icp_reason", "TEXT DEFAULT ''"),
+        ):
+            await db.execute(f"ALTER TABLE companies ADD COLUMN {column} {typedef}")
+        await db.execute("PRAGMA user_version = 12")
+        await db.commit()
+
+    sm = StateManager(db_path)
+    await sm.init_db()
+    async with aiosqlite.connect(db_path) as db:
+        async with db.execute("PRAGMA user_version") as cursor:
+            (version,) = await cursor.fetchone()
+        async with db.execute("PRAGMA table_info(companies)") as cursor:
+            company_cols = {row[1] for row in await cursor.fetchall()}
+        async with db.execute("PRAGMA table_info(usage_log)") as cursor:
+            usage_cols = [row[1] for row in await cursor.fetchall()]
+    assert version == 13
+    assert {"address", "brand", "latitude", "longitude", "kind", "icp_score"} <= company_cols
+    assert usage_cols.count("cursor_calls") == 1
+
+
+def test_train_keeps_a_filled_lead_list_config():
+    generated = {
+        "persona": {"name": "Generated Name", "company": "Generated Co"},
+        "product": {"name": "Generated Product", "description": "From the site"},
+        "icp": {
+            "industries": ["SaaS"],
+            "company_size": "1-10",
+            "titles": ["CEO", "VP Sales"],
+            "geography": ["United States"],
+            "geo_coordinates": {},
+        },
+        "language": "en",
+        "compliance": {"regime": ""},
+        "channels": {"email": {"enabled": True, "provider": "instantly"}},
+        "usage": {
+            "quiet_hours": {
+                "start": "22:00", "end": "07:00", "timezone": "America/New_York",
+            },
+        },
+    }
+    existing = {
+        "product": {"name": "Etiquetas e rótulos"},
+        "icp": {
+            "industries": ["Cervejarias"],
+            "company_size": "",
+            "titles": ["Proprietário"],
+            "geography": ["Curitiba e região metropolitana, PR"],
+            "geo_coordinates": {
+                "Curitiba e região metropolitana, PR": "-25.4284,-49.2733,40",
+            },
+        },
+        "language": "pt-BR",
+        "compliance": {"regime": "br"},
+        "channels": {"email": {"enabled": False, "provider": "none"}},
+        "usage": {
+            "quiet_hours": {
+                "start": "22:00", "end": "07:00", "timezone": "America/Sao_Paulo",
+            },
+        },
+    }
+    out = preserve_operator_settings(generated, existing)
+    assert out["language"] == "pt-BR"
+    assert out["compliance"]["regime"] == "br"
+    assert out["icp"]["industries"] == ["Cervejarias"]
+    assert out["icp"]["titles"] == ["Proprietário"]
+    assert out["icp"]["company_size"] == "1-10"
+    assert out["icp"]["geo_coordinates"][
+        "Curitiba e região metropolitana, PR"
+    ].startswith("-25.4284")
+    assert out["channels"]["email"]["enabled"] is False
+    assert out["channels"]["email"]["provider"] == "none"
+    assert out["usage"]["quiet_hours"]["timezone"] == "America/Sao_Paulo"
+    assert out["product"]["name"] == "Generated Product"
+    assert out["persona"]["company"] == "Generated Co"

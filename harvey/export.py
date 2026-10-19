@@ -131,6 +131,38 @@ async def export_prospects_csv(
     return len(rows), text
 
 
+def _one_per_brand(companies: list) -> tuple[list, dict[str, int], dict[str, list[str]]]:
+    """Keep the strongest row of each chain. Independents stay as they are.
+
+    The returned map is kept-id → how many branches were grouped, so the
+    CSV can say so after the score reason is chosen.
+    """
+    from harvey.brands import brand_key
+
+    grouped: dict[str, list] = {}
+    order: list[str] = []
+    for company in companies:
+        key = (company.brand or "").strip() or brand_key(company.name) or f"id:{company.id}"
+        if key not in grouped:
+            order.append(key)
+            grouped[key] = []
+        grouped[key].append(company)
+    kept = []
+    counts: dict[str, int] = {}
+    siblings: dict[str, list[str]] = {}
+    for key in order:
+        rows = grouped[key]
+        best = max(rows, key=lambda company: (
+            1 if (company.website or company.domain) else 0,
+            1 if company.phone else 0,
+            int(company.icp_score or 0),
+        ))
+        kept.append(best)
+        counts[best.id] = len(rows)
+        siblings[best.id] = [company.id for company in rows]
+    return kept, counts, siblings
+
+
 def _website(company) -> str:
     site = (getattr(company, "website", "") or "").strip()
     if site:
@@ -161,16 +193,26 @@ async def collect_leads(
     state: StateManager,
     config=None,
     min_score: int = 0,
+    one_per_brand: bool = True,
 ) -> list[dict]:
     """One row per company, best owner or buyer attached when one exists.
 
     Companies with no contact and no email are included. A published
     inbox (contato@) is labeled ``published`` so it is not mistaken for
-    a verified personal mailbox.
+    a verified personal mailbox. Chain branches collapse to one row
+    unless ``one_per_brand`` is false. Print and label shops are left out.
     """
+    from harvey.brands import is_competitor_name
     from harvey.scoring import pick_best_contact
 
-    companies = await state.list_companies()
+    companies = [
+        company for company in await state.list_companies()
+        if not is_competitor_name(company.name) and (company.kind or "") != "competitor"
+    ]
+    branch_counts: dict[str, int] = {}
+    siblings: dict[str, list[str]] = {}
+    if one_per_brand:
+        companies, branch_counts, siblings = _one_per_brand(companies)
     prospects = await state.list_prospects()
     by_company: dict[str, list] = {}
     for prospect in prospects:
@@ -180,9 +222,21 @@ async def collect_leads(
     rows = []
     for company in companies:
         score, reason = _lead_score(company, config)
+        branches = branch_counts.get(company.id, 1)
+        if branches > 1:
+            if getattr(config, "language", "en") == "pt-BR":
+                note = f"{branches} filiais agrupadas."
+            else:
+                note = f"{branches} branches grouped."
+            reason = f"{reason} {note}".strip()
+        contact_pool = []
+        for sibling_id in siblings.get(company.id, [company.id]):
+            contact_pool.extend(by_company.get(sibling_id) or [])
+        if not contact_pool:
+            contact_pool = by_company.get(company.id) or []
         if min_score and score < min_score:
             continue
-        best = pick_best_contact(by_company.get(company.id) or [])
+        best = pick_best_contact(contact_pool)
         phone = (getattr(company, "phone", "") or "").strip()
         contact_name = contact_title = contact_email = confidence = ""
         if best is not None:
@@ -229,9 +283,12 @@ async def export_leads_csv(
     out_path: str | None = None,
     config=None,
     min_score: int = 0,
+    one_per_brand: bool = True,
 ) -> tuple[int, str]:
     """Export the lead list. Returns (row_count, csv_text)."""
-    rows = await collect_leads(state, config=config, min_score=min_score)
+    rows = await collect_leads(
+        state, config=config, min_score=min_score, one_per_brand=one_per_brand,
+    )
     text = leads_to_csv(rows)
     if out_path:
         with open(out_path, "w", newline="") as f:

@@ -32,6 +32,63 @@ def _normalize_start_url(url: str) -> str:
         url = f"https://{url}"
     return url
 
+
+def _blank(value) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, dict)):
+        return len(value) == 0
+    return False
+
+
+def _keep_filled(existing, generated):
+    """Existing wins wherever it is filled. Generated fills the blanks."""
+    if _blank(existing):
+        return generated
+    if not isinstance(existing, dict):
+        return existing
+    out = dict(generated or {})
+    for key, value in existing.items():
+        if isinstance(value, dict):
+            out[key] = _keep_filled(value, out.get(key))
+        elif not _blank(value):
+            out[key] = value
+    return out
+
+
+def _read_yaml(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        with open(path) as f:
+            loaded = yaml.safe_load(f)
+    except (OSError, yaml.YAMLError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def preserve_operator_settings(generated: dict, existing: dict | None) -> dict:
+    """Keep a lead-list install's choices when training rewrites the file.
+
+    Product and persona come from the site. ICP, language, compliance,
+    channels, and quiet hours stay as the operator set them; training
+    fills a key only when it is missing or empty.
+    """
+    if not existing:
+        return generated
+    out = dict(generated)
+    for key in ("icp", "language", "compliance", "channels"):
+        if key in existing:
+            out[key] = _keep_filled(existing[key], generated.get(key))
+    quiet = ((existing.get("usage") or {}).get("quiet_hours") or None)
+    if quiet:
+        usage = dict(out.get("usage") or {})
+        usage["quiet_hours"] = _keep_filled(quiet, usage.get("quiet_hours"))
+        out["usage"] = usage
+    return out
+
 # Fallback: pages to try if Cloudflare crawl is unavailable
 FALLBACK_PATHS = [
     "/", "/about", "/about-us", "/pricing", "/features", "/product",
@@ -410,10 +467,14 @@ class Trainer:
         config = self._build_config(product_info, icp_info, objections, domain)
 
         # Write config (relative paths resolve against the project root,
-        # so training works no matter what directory it's launched from)
+        # so training works no matter what directory it's launched from).
+        # An existing file keeps the operator's ICP, language, compliance,
+        # channels, and quiet-hours timezone. Training fills only what is blank.
         config_path = Path(output_path)
         if not config_path.is_absolute():
             config_path = PROJECT_ROOT / config_path
+        existing = _read_yaml(config_path)
+        config = preserve_operator_settings(config, existing)
         with open(config_path, "w") as f:
             yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 

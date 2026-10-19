@@ -10,6 +10,7 @@ upgrade cleanly in place.
 """
 
 import json
+import re
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, date, timezone
@@ -413,15 +414,77 @@ MIGRATIONS: list[str] = [
     -- so one subscription's budget never consumes the other's.
     ALTER TABLE usage_log ADD COLUMN codex_calls INTEGER DEFAULT 0;
     """,
-    # ── v12: lead-list fields (address, city, published email, ICP score) ──
+    # ── v12: Cursor subscription calls count separately too ──
+    # Owned by the Cursor brain provider. Kept here so this branch's next
+    # migration is v13 either way the two pull requests merge. Adding the
+    # column is skipped when it already exists.
+    """
+    -- claude_calls and codex_calls keep their own subscriptions. Cursor has
+    -- no quota API, so this counter is also the budget.
+    ALTER TABLE usage_log ADD COLUMN cursor_calls INTEGER DEFAULT 0;
+    """,
+    # ── v13: lead-list fields (address, city, published email, ICP score,
+    # brand, coordinates). A database that already applied the company
+    # columns under an earlier draft of this branch (when they were v12)
+    # skips the ALTERs that exist and still picks up brand, coordinates,
+    # and cursor_calls.
     """
     ALTER TABLE companies ADD COLUMN address TEXT DEFAULT '';
     ALTER TABLE companies ADD COLUMN city TEXT DEFAULT '';
     ALTER TABLE companies ADD COLUMN public_email TEXT DEFAULT '';
     ALTER TABLE companies ADD COLUMN icp_score INTEGER DEFAULT 0;
     ALTER TABLE companies ADD COLUMN icp_reason TEXT DEFAULT '';
+    ALTER TABLE companies ADD COLUMN brand TEXT DEFAULT '';
+    ALTER TABLE companies ADD COLUMN latitude REAL;
+    ALTER TABLE companies ADD COLUMN longitude REAL;
+    ALTER TABLE companies ADD COLUMN kind TEXT DEFAULT '';
+    CREATE UNIQUE INDEX IF NOT EXISTS uq_companies_brand
+        ON companies(brand) WHERE brand != '';
+    ALTER TABLE usage_log ADD COLUMN cursor_calls INTEGER DEFAULT 0;
     """,
 ]
+
+_ADD_COLUMN = re.compile(
+    r"ALTER\s+TABLE\s+([A-Za-z_][A-Za-z0-9_]*)\s+ADD\s+COLUMN\s+([A-Za-z_][A-Za-z0-9_]*)",
+    re.IGNORECASE,
+)
+
+def _sql_statements(script: str) -> list[str]:
+    """Split a migration on semicolons that end a line. Comments stay attached."""
+    parts: list[str] = []
+    buf: list[str] = []
+    for line in script.splitlines():
+        buf.append(line)
+        if line.strip().endswith(";"):
+            parts.append("\n".join(buf))
+            buf = []
+    if any(line.strip() for line in buf):
+        parts.append("\n".join(buf))
+    return parts
+
+
+async def _column_exists(db, table: str, column: str) -> bool:
+    async with db.execute(f"PRAGMA table_info({table})") as cursor:
+        rows = await cursor.fetchall()
+    return any(row[1] == column for row in rows)
+
+
+async def _apply_migration(db, script: str):
+    """Run a migration, skipping ADD COLUMN when the column is already there.
+
+    SQLite rejects a second ADD COLUMN. That happens when two branches both
+    shipped a v12, and when a draft of this branch already added the lead
+    columns under the old number.
+    """
+    kept: list[str] = []
+    for statement in _sql_statements(script):
+        match = _ADD_COLUMN.search(statement)
+        if match and await _column_exists(db, match.group(1), match.group(2)):
+            continue
+        kept.append(statement)
+    if kept:
+        await db.executescript("\n".join(kept))
+
 
 BRAIN_PROVIDERS = ("claude", "codex")
 _USAGE_LOG_COLUMN = {"claude": "claude_calls", "codex": "codex_calls"}
@@ -481,7 +544,7 @@ class StateManager:
 
             for target, script in enumerate(MIGRATIONS, start=1):
                 if version < target:
-                    await db.executescript(script)
+                    await _apply_migration(db, script)
                     await db.execute(f"PRAGMA user_version = {target}")
                     await db.commit()
 
@@ -517,16 +580,19 @@ class StateManager:
                 """INSERT OR IGNORE INTO companies
                    (id, name, domain, website, description, industry,
                     company_size, location, phone, address, city, public_email,
-                    icp_score, icp_reason, source, source_url,
+                    icp_score, icp_reason, brand, latitude, longitude, kind,
+                    source, source_url,
                     external_id, notes, tech_stack_json, signals_json,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     company.id, company.name, company.domain, company.website,
                     company.description, company.industry, company.company_size,
                     company.location, company.phone, company.address, company.city,
                     company.public_email, int(company.icp_score or 0),
-                    company.icp_reason, company.source,
+                    company.icp_reason, company.brand or "",
+                    company.latitude, company.longitude, company.kind or "",
+                    company.source,
                     company.source_url, company.external_id, company.notes,
                     json.dumps(company.tech_stack), json.dumps(company.signals),
                     company.created_at.isoformat(),
@@ -537,7 +603,8 @@ class StateManager:
             if cursor.rowcount == 0:
                 # Uniqueness conflict: hand back the existing record's id.
                 for column, value in (("domain", company.domain),
-                                      ("external_id", company.external_id)):
+                                      ("external_id", company.external_id),
+                                      ("brand", company.brand)):
                     if not value:
                         continue
                     async with db.execute(
@@ -621,6 +688,7 @@ class StateManager:
     _LEAD_COLUMNS = frozenset({
         "address", "city", "phone", "website", "public_email",
         "icp_score", "icp_reason", "industry",
+        "brand", "latitude", "longitude", "kind",
     })
 
     async def update_company_lead(self, company_id: str, **fields):
@@ -638,6 +706,17 @@ class StateManager:
                 (*fields.values(), company_id),
             )
             await db.commit()
+
+    async def get_company_by_brand(self, brand: str) -> Company | None:
+        if not (brand or "").strip():
+            return None
+        async with self._connect() as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute(
+                "SELECT * FROM companies WHERE brand = ?", (brand,)
+            ) as cursor:
+                row = await cursor.fetchone()
+                return self._company_from_row(row) if row else None
 
     async def list_companies(self) -> list[Company]:
         async with self._connect() as db:
