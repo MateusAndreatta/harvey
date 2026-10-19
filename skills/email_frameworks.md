@@ -16,6 +16,7 @@ Style rules are negotiable. These are not:
 - **Any opt-out wording counts.** "Stop", "remove me", "not interested, don't email again" — treat all of them as unsubscribes, immediately and permanently, even mid-conversation.
 - **Deliverability hygiene:** plain text only, at most one link per email (zero in email 1 is better), no attachments, no image pixels beyond what the platform adds, no ALL-CAPS or spam-trigger phrasing ("free money", "act now", "guarantee"). One recipient's spam report costs more than a hundred sends earn.
 - **EU/UK prospects:** B2B cold email requires a defensible legitimate-interest basis — the pitch must be genuinely relevant to the person's professional role, and the first email should make it easy to object. When relevance is a stretch, don't send.
+- **Brazil (LGPD):** B2B contact on legitimate interest only when the message is relevant to the person's role. Identify the sender and include a clear descadastro. "Descadastre", "não quero mais", and "pare de enviar" are unsubscribes, honored immediately.
 
 ---
 

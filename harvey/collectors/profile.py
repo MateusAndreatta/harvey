@@ -18,6 +18,8 @@ from urllib.parse import urljoin, urlparse
 
 import httpx
 
+from harvey.textutil import fold
+
 logger = logging.getLogger("harvey.collectors.profile")
 
 TIMEOUT = httpx.Timeout(connect=8.0, read=12.0, write=8.0, pool=8.0)
@@ -57,7 +59,7 @@ BENIGN_HOSTS = (
 # an email is worse than saying nothing at all.
 STRONG_CREDIT = re.compile(
     r"\b(powered|website|site|web\s*design|designed|developed|built|created|"
-    r"marketing)\s+(by|&)\b", re.I)
+    r"marketing|desenvolvido|criado|feito|produzido)\s+(by|por|&)\b", re.I)
 DESCRIPTIVE_CREDIT = re.compile(
     r"\b(web\s*design|website\s*design|digital\s*marketing|seo|marketing\s*"
     r"agency|web\s*development)\b", re.I)
@@ -94,23 +96,28 @@ META_PIXEL = (r"connect\.facebook\.net/[^\"']*fbevents\.js", r"fbq\s*\(\s*['\"]i
 BOOKING_HINTS = (r"calendly\.com", r"acuityscheduling", r"schedulicity",
                  r"squareup\.com/appointments", r"setmore", r"book(ing)?[-_]?now",
                  r"schedule[-_]?(an?[-_])?(appointment|estimate|consultation)",
-                 r"housecallpro", r"getjobber\.com", r"servicetitan")
+                 r"housecallpro", r"getjobber\.com", r"servicetitan",
+                 r"agende", r"agendamento", r"or[cç]amento", r"whatsapp",
+                 r"wa\.me/")
 
 AI_CRAWLERS = ("gptbot", "google-extended", "ccbot", "anthropic-ai", "claudebot",
                "perplexitybot", "bytespider")
 
 TEAM_PATHS = ("/team", "/about", "/about-us", "/our-team", "/staff",
-              "/leadership", "/meet-the-team", "/company/team")
+              "/leadership", "/meet-the-team", "/company/team",
+              "/sobre", "/quem-somos", "/empresa", "/equipe", "/nossa-equipe")
 CAREERS_PATHS = ("/careers", "/jobs", "/join-us", "/employment", "/hiring",
-                 "/about/careers", "/careers/")
+                 "/about/careers", "/careers/",
+                 "/trabalhe-conosco", "/vagas", "/carreiras")
 CONTACT_PATHS = ("/contact", "/contact-us", "/get-a-quote", "/free-estimate",
-                 "/request-estimate", "/quote")
+                 "/request-estimate", "/quote",
+                 "/contato", "/fale-conosco")
 
 # Words that are never part of a person's name. Without this, headings like
 # "Request Service", "Baker History" and "Commercial Services" pass a
 # Firstname-Lastname regex and become contacts — the single most common
 # failure mode when scraping team pages.
-NON_NAME_WORDS = frozenset("""
+NON_NAME_WORDS = frozenset(fold(w) for w in """
 service services repair repairs roofing roof roofs contractor contracting
 commercial residential industrial storm damage restoration installation
 history about contact quote quotes estimate estimates free request get call
@@ -122,6 +129,12 @@ shingles tile flat emergency 24 hour hours today now new best top quality
 privacy policy terms conditions sitemap blog news events why choose us
 areas served locations location city county state north south east west
 español espanol menu skip navigation search close open toggle
+sobre nossa nosso nossos nossas equipe empresa contato fale conosco
+trabalhe vagas carreiras quem somos servicos serviços produtos
+historia história orcamento orçamento catalogo catálogo
+socio sócio socia sócia fundador fundadora proprietario proprietário
+proprietaria proprietária dono dona diretor diretora gerente
+comprador compradora compras marketing presidente
 """.split())
 
 DECISION_MAKER_TITLES = (
@@ -129,6 +142,15 @@ DECISION_MAKER_TITLES = (
     "partner", "general manager", "operations manager", "practice manager",
     "office manager", "marketing director", "marketing manager",
     "director of marketing", "vice president", "vp ", "managing director",
+    # Brazilian titles. Longer phrases first so the extracted slice keeps them.
+    "sócio-fundador", "socio-fundador", "sócio fundador", "socio fundador",
+    "sócia-fundadora", "socia-fundadora",
+    "proprietário", "proprietario", "proprietária", "proprietaria",
+    "fundador", "fundadora", "cofundador",
+    "sócio", "socio", "sócia", "socia",
+    "dono", "dona", "presidente",
+    "diretor", "diretora",
+    "gerente", "comprador", "compradora", "compras", "marketing",
 )
 
 
@@ -137,7 +159,67 @@ ROLE_HINT = re.compile(
     r"director|supervisor|superintendent|foreman|estimator|specialist|"
     r"consultant|coordinator|representative|rep|sales|marketing|operations|"
     r"office|project|account|service|technician|installer|inspector|"
-    r"vice president|vp|executive|lead|head of|chief)\b", re.I)
+    r"vice president|vp|executive|lead|head of|chief|"
+    r"s[oó]ci[oa]|propriet[aá]ri[oa]|don[oa]|diretor[a]?|gerente|"
+    r"comprador[a]?|compras|fundador[a]?|presidente)\b", re.I)
+
+
+_MAILTO_RE = re.compile(
+    r"mailto:([A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,})", re.I)
+_WA_RE = re.compile(
+    r"https?://(?:wa\.me|api\.whatsapp\.com)/([0-9]{10,15})", re.I)
+_TEL_RE = re.compile(
+    r"tel:\s*(\+?55[\d\s().-]{8,18}|\(?[1-9][0-9]\)?\s*9?\d{4}[\s.\-]\d{4})",
+    re.I,
+)
+_BR_PHONE_RE = re.compile(
+    r"(?:\+55\s*)?\(?[1-9][0-9]\)?\s*(?:9\s*)?\d{4}[\s.\-]\d{4}"
+)
+
+
+def _clean_phone(raw: str) -> str:
+    digits = re.sub(r"\D", "", raw or "")
+    if digits.startswith("55") and len(digits) >= 12:
+        digits = digits[2:]
+    if len(digits) not in (10, 11):
+        return ""
+    if len(digits) == 11:
+        return f"({digits[:2]}) {digits[2:7]}-{digits[7:]}"
+    return f"({digits[:2]}) {digits[2:6]}-{digits[6:]}"
+
+
+def extract_published_contacts(html: str) -> dict:
+    """Phone, WhatsApp, and a published inbox from HTML already fetched.
+
+    Brazilian sites usually put the reachable number on WhatsApp and the
+    inbox at contato@ or comercial@, not on a team card.
+    """
+    if not html:
+        return {"phone": "", "email": "", "whatsapp": ""}
+    whatsapp = ""
+    phone = ""
+    wa = _WA_RE.search(html)
+    if wa:
+        whatsapp = wa.group(0)
+        phone = _clean_phone(wa.group(1))
+    if not phone:
+        tel = _TEL_RE.search(html)
+        if tel:
+            phone = _clean_phone(tel.group(1))
+    if not phone:
+        shown = _BR_PHONE_RE.search(_text(html))
+        if shown:
+            phone = _clean_phone(shown.group(0))
+    emails = [m.group(1).strip().lower() for m in _MAILTO_RE.finditer(html)]
+    preferred = ("contato@", "comercial@", "vendas@", "compras@", "sac@")
+    email = ""
+    for prefix in preferred:
+        email = next((e for e in emails if e.startswith(prefix)), "")
+        if email:
+            break
+    if not email and emails:
+        email = emails[0]
+    return {"phone": phone, "email": email, "whatsapp": whatsapp}
 
 
 def title_looks_like_role(text: str) -> bool:
@@ -185,7 +267,8 @@ class ProfileCollector:
         self._client = httpx.AsyncClient(
             timeout=TIMEOUT, follow_redirects=True,
             headers={"User-Agent": random.choice(USER_AGENTS),
-                     "Accept": "text/html,application/xhtml+xml,*/*;q=0.8"},
+                     "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+                     "Accept-Language": "pt-BR,pt;q=0.9,en;q=0.8"},
         )
         return self
 
@@ -221,6 +304,29 @@ class ProfileCollector:
             if html:
                 return base, html
         return "", ""
+
+    async def _save_published_contacts(self, company_id: str, channels: dict):
+        """Fill phone and public inbox when discovery didn't already have them."""
+        if not channels or not (channels.get("phone") or channels.get("email")):
+            return
+        try:
+            current = await self.state.get_company(company_id)
+        except Exception as e:
+            logger.debug(f"company lookup failed for {company_id}: {e}")
+            return
+        if current is None:
+            return
+        fields = {}
+        if channels.get("phone") and not (current.phone or "").strip():
+            fields["phone"] = channels["phone"]
+        if channels.get("email") and not (current.public_email or "").strip():
+            fields["public_email"] = channels["email"]
+        if not fields:
+            return
+        try:
+            await self.state.update_company_lead(company_id, **fields)
+        except Exception as e:
+            logger.debug(f"saving published contacts failed for {company_id}: {e}")
 
     async def _first_present(self, site: str, paths) -> tuple[str, str]:
         """Return (url, html) for the first path that returns content."""
@@ -283,10 +389,17 @@ class ProfileCollector:
         """Names + titles from a team page. Conservative on purpose."""
         text_html = _strip_code(html)
         people, seen = [], set()
-        # Name in a heading, title in the nearby text.
+        # Name in a heading, title in the nearby text. Accented letters and
+        # Portuguese particles (da, de, do, das, dos) so "João da Silva" counts.
+        cap = r"[A-ZÀ-ÖØ-Þ]"
+        token = rf"{cap}[A-Za-zÀ-ÿ'\-]+"
+        particle = r"(?:d[aeo]s?|e)"
+        name_re = (
+            rf"{token}(?:\s+(?:{particle}\s+)?(?:{cap}\.?\s+)?{token}){{1,3}}"
+        )
         for m in re.finditer(
-            r"(?is)<(h[1-5]|strong|b)[^>]*>\s*([A-Z][a-z'\-]+(?:\s+[A-Z]\.?)?\s+"
-            r"[A-Z][a-zA-Z'\-]+)\s*</\1>(?=(.{0,220}))", text_html
+            rf"(?is)<(h[1-5]|strong|b)[^>]*>\s*({name_re})\s*</\1>(?=(.{{0,220}}))",
+            text_html,
         ):
             # NOTE the lookahead above: capturing the trailing context normally
             # would CONSUME it, so finditer would skip every person whose entry
@@ -309,7 +422,7 @@ class ProfileCollector:
             # Reject headings that merely LOOK like names. Every token must be
             # plausibly a name part; one business word disqualifies the whole
             # match ("Request Service", "Baker History", "Commercial Services").
-            tokens = [t.strip(".,'-").lower() for t in name.split()]
+            tokens = [fold(t.strip(".,'-")) for t in name.split()]
             if any(t in NON_NAME_WORDS for t in tokens):
                 continue
             # A real contact needs a title that reads like a role; a bare
@@ -412,14 +525,37 @@ class ProfileCollector:
                         except ValueError:
                             pass
 
-        # contact form — reaches the business without needing an email at all
+        # Published phone / inbox / WhatsApp. Not a signal: the lead list
+        # needs them even when no signal is confirmed. Homepage first, then
+        # the contact page when the homepage didn't say.
+        channels = extract_published_contacts(home)
+        contact_url, contact_html = "", ""
+        if not (channels.get("phone") and channels.get("email")):
+            contact_url, contact_html = await self._first_present(site, CONTACT_PATHS)
+            more = extract_published_contacts(contact_html) if contact_html else {}
+            for key in ("phone", "email", "whatsapp"):
+                if not channels.get(key) and more.get(key):
+                    channels[key] = more[key]
+        await self._save_published_contacts(company_id, channels)
+
+        # contact form — reaches the business without needing an email at all.
+        # A WhatsApp link counts: that is how a lot of Brazilian companies
+        # actually answer.
         if self.wants("CONTACT_FORM_URL"):
             if re.search(r"(?is)<form\b", _strip_code(home)):
                 add("CONTACT_FORM_URL", text=site, url=site)
-            else:
+            elif contact_html and re.search(r"(?is)<form\b", _strip_code(contact_html)):
+                add("CONTACT_FORM_URL", text=contact_url, url=contact_url)
+            elif not contact_html:
                 curl, chtml = await self._first_present(site, CONTACT_PATHS)
                 if chtml and re.search(r"(?is)<form\b", _strip_code(chtml)):
                     add("CONTACT_FORM_URL", text=curl, url=curl)
+                elif channels.get("whatsapp"):
+                    add("CONTACT_FORM_URL", text=channels["whatsapp"],
+                        url=channels["whatsapp"])
+            elif channels.get("whatsapp"):
+                add("CONTACT_FORM_URL", text=channels["whatsapp"],
+                    url=channels["whatsapp"])
 
         # careers page → hiring intent
         if self.wants("HIRING_ROLE"):
@@ -432,7 +568,8 @@ class ProfileCollector:
                     t = re.sub(r"\s+", " ", m.group(2)).strip()
                     if re.search(r"\b(hiring|apply|position|opening|wanted|"
                                  r"technician|installer|sales|manager|foreman|"
-                                 r"estimator|crew|representative)\b", t, re.I):
+                                 r"estimator|crew|representative|"
+                                 r"vaga|vagas|candidat|contrat|trabalhe)\b", t, re.I):
                         if t.lower() not in [r.lower() for r in roles]:
                             roles.append(t)
                     if len(roles) >= 3:
@@ -487,6 +624,12 @@ class ProfileCollector:
                 logger.info(f"profile: {domain} → {len(obs)} observation(s)")
             await asyncio.sleep(random.uniform(0.4, 1.2))
         return total
+
+
+def people_from_html(html: str) -> list[dict]:
+    """Names and titles from a team or about page."""
+    parser = ProfileCollector.__new__(ProfileCollector)
+    return parser.detect_people(html)
 
 
 async def profile_companies(state, companies: list[dict]) -> tuple[int, str]:

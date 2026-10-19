@@ -1,0 +1,89 @@
+# Example for a lead list in Brazil. Copy to harvey.local.yaml (gitignored)
+# and replace the placeholders. Nothing here is a real company.
+#
+# Email sending is off on purpose: discover, profile, scout, and
+# `harvey export` do not need Gmail, SMTP, or any key in .env.
+# OpenStreetMap is free and maps premises. A store that exists only
+# online is not in it, and "e-commerce" is not searched as wholesale.
+
+language: pt-BR
+
+persona:
+  name: "Seu Nome"
+  company: "Sua Empresa"
+  role: "Comercial"
+  email: "voce@suaempresa.com.br"
+  linkedin: ""
+  tone: "direto, profissional, sem jargão"
+
+product:
+  name: "Etiquetas e rótulos"
+  description: "Etiquetas e rótulos para quem produz e vende produto físico."
+  pricing: "Sob consulta"
+  key_benefits:
+    - "Rótulo certo para o produto e para o prazo"
+    - "Atende do pequeno lote ao pedido recorrente"
+    - "Fala com quem compra, não com um departamento genérico"
+  objection_responses: {}
+  offer:
+    primary: "Fornecimento de etiquetas e rótulos"
+    entry: "Orçamento sem compromisso"
+    goal: "get_reply"
+    booking_method: "ask_preference"
+    meeting_duration: "15 minutes"
+    meeting_owner: "Seu Nome"
+
+icp:
+  industries:
+    - "Cervejarias"
+    - "Vinícolas"
+    - "Destilarias"
+    - "Alimentos e bebidas"
+    - "Padarias"
+    - "Confeitarias"
+    - "Cosméticos"
+    - "Confecções"
+    - "Farmácias de manipulação"
+    - "Indústria"
+  company_size: "pequeno e médio"
+  titles:
+    - "Proprietário"
+    - "Sócio"
+    - "Comprador"
+    - "Gerente de compras"
+  geography:
+    - "Curitiba e região metropolitana, PR"
+    - "São Paulo, SP"
+  # Keys must match geography exactly. lat,lng,radius_km.
+  # Towns inside the radius count as in-region, and a "região metropolitana"
+  # label also accepts that metro's municipalities.
+  # OSM does not search online-only stores. "E-commerce" is not an industry here.
+  geo_coordinates:
+    "Curitiba e região metropolitana, PR": "-25.4284,-49.2733,40"
+    "São Paulo, SP": "-23.5505,-46.6333,40"
+  hiring_signals: []
+  # Mary Kay, "Aqui tem Natura", and an O Boticário counter are left out
+  # of cosmetics. A manufacturer stays. Set false to keep the counters.
+  exclude_resellers: true
+
+channels:
+  email:
+    enabled: false
+    provider: "none"
+    max_daily_sends: 0
+    require_approval: true
+  linkedin:
+    enabled: false
+
+usage:
+  max_daily_claude_percent: 80
+  heartbeat_interval_minutes: 15
+  quiet_hours:
+    start: "22:00"
+    end: "07:00"
+    timezone: "America/Sao_Paulo"
+
+compliance:
+  regime: br
+  precleared:
+    enabled: false

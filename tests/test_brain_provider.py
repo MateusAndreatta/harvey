@@ -366,7 +366,7 @@ async def test_existing_usage_rows_become_claude(tmp_path):
     assert await sm.get_usage_today("codex") == 0
     summary = await sm.get_state_summary()
     assert summary["usage_today"] == 7
-    assert summary["usage_today_by_provider"] == {"claude": 7, "codex": 0}
+    assert summary["usage_today_by_provider"] == {"claude": 7, "codex": 0, "cursor": 0}
     with pytest.raises(ValueError):
         await sm.record_usage_event(provider="gemini")
 
@@ -399,8 +399,9 @@ def test_cli_train_flags_select_the_provider(monkeypatch):
     seen = {}
 
     class FakeTrainer:
-        def __init__(self, brain_config=None):
+        def __init__(self, brain_config=None, brain_override=False):
             seen["config"] = brain_config
+            seen["override"] = brain_override
 
         async def train(self, url, max_pages=100):
             seen["url"] = url
@@ -414,10 +415,12 @@ def test_cli_train_flags_select_the_provider(monkeypatch):
     cli.cmd_train(args)
     # Switching provider never carries the other provider's model along.
     assert seen["config"] == BrainConfig(provider="codex", reasoning_effort="low")
+    assert seen["override"] is True
 
     args.provider, args.reasoning_effort = None, None
     cli.cmd_train(args)
     assert seen["config"] == BrainConfig(provider="claude", model="claude-opus-4-8")
+    assert seen["override"] is False
 
 
 def _answering(answers, prompts):
@@ -543,6 +546,47 @@ def test_dashboard_codex_quota_is_labelled_codex(client, monkeypatch):
     stats = client.get("/api/stats").json()
     assert stats["brain_provider"] == "codex"
     assert stats["codex_calls_today"] == 0 and stats["claude_calls_today"] == 0
+
+
+def test_stats_counts_usage_on_the_local_date_not_utc(client):
+    """usage_log is stamped with date.today(). SQLite date('now') is UTC."""
+    import os
+    import time
+    from datetime import date, datetime, timezone
+
+    import aiosqlite
+
+    utc_now = datetime.now(timezone.utc)
+    zone = "Etc/GMT-14" if utc_now.hour >= 12 else "Etc/GMT+12"
+    old = os.environ.get("TZ")
+    os.environ["TZ"] = zone
+    time.tzset()
+    try:
+        local = date.today().isoformat()
+        utc = datetime.now(timezone.utc).date().isoformat()
+        assert local != utc
+
+        async def seed():
+            async with aiosqlite.connect(str(client.db_path)) as db:
+                await db.execute(
+                    "INSERT INTO usage_log (id, date, claude_calls) VALUES ('local', ?, 4)",
+                    (local,),
+                )
+                await db.execute(
+                    "INSERT INTO usage_log (id, date, claude_calls) VALUES ('utc', ?, 99)",
+                    (utc,),
+                )
+                await db.commit()
+
+        asyncio.run(seed())
+        stats = client.get("/api/stats").json()
+        assert stats["claude_calls_today"] == 4
+    finally:
+        if old is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = old
+        time.tzset()
 
 
 def test_dashboard_claude_default_unchanged(client, monkeypatch):

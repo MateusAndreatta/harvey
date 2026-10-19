@@ -44,10 +44,17 @@ icp:
   # scanning and job-board discovery. Empty = fall back to titles above.
   hiring_signals: []
 
+# Output language for scoring reasons and the Signals tab. en or pt-BR.
+# pt-BR adds one line to model prompts; it does not rewrite the email files.
+# Lead lists do not need translated email copy.
+language: en
+
 channels:
   email:
     enabled: true
-    provider: "gmail"          # gmail (recommended) | microsoft | smtp | instantly
+    # gmail (recommended) | microsoft | smtp | instantly | none
+    # enabled: false and provider: none builds lead lists with no mailbox.
+    provider: "gmail"
     max_daily_sends: 50
     require_approval: true      # native providers: emails wait in the Outbox
     send_to_risky: false        # also send to catch-all domains (off = safest)
@@ -72,6 +79,9 @@ usage:
 # address; 10 a day free without a key, 25 with a free key (PRECLEARED_API_KEY
 # in .env). Applies to the native providers (gmail, smtp).
 compliance:
+  # "" | us | uk | eu | ca | br. Aliases: can-spam, pecr, gdpr, casl, lgpd.
+  # Only changes copy when email sending is on. Lead lists do not send.
+  regime: ""
   precleared:
     enabled: false
     sender_country: ""          # GB or US: where your business is based

@@ -32,6 +32,134 @@ def _normalize_start_url(url: str) -> str:
         url = f"https://{url}"
     return url
 
+
+def _blank(value) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, dict)):
+        return len(value) == 0
+    return False
+
+
+def _keep_filled(existing, generated):
+    """Existing wins wherever it is filled. Generated fills the blanks."""
+    if _blank(existing):
+        return generated
+    if not isinstance(existing, dict):
+        return existing
+    out = dict(generated or {})
+    for key, value in existing.items():
+        if isinstance(value, dict):
+            out[key] = _keep_filled(value, out.get(key))
+        elif not _blank(value):
+            out[key] = value
+    return out
+
+
+def _read_yaml(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        with open(path) as f:
+            loaded = yaml.safe_load(f)
+    except (OSError, yaml.YAMLError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def preserve_operator_settings(generated: dict, existing: dict | None) -> dict:
+    """Keep a lead-list install's choices when training rewrites the file.
+
+    Product and persona come from the site. ICP, language, compliance,
+    channels, and quiet hours stay as the operator set them; training
+    fills a key only when it is missing or empty.
+    """
+    if not existing:
+        return generated
+    out = dict(generated)
+    for key in ("icp", "language", "compliance", "channels"):
+        if key in existing:
+            out[key] = _keep_filled(existing[key], generated.get(key))
+    quiet = ((existing.get("usage") or {}).get("quiet_hours") or None)
+    if quiet:
+        usage = dict(out.get("usage") or {})
+        usage["quiet_hours"] = _keep_filled(quiet, usage.get("quiet_hours"))
+        out["usage"] = usage
+    return out
+
+
+_USAGE_TEMPLATE = {
+    "max_daily_claude_percent": 80,
+    "max_daily_cursor_calls": 200,
+    "heartbeat_interval_minutes": 15,
+    "quiet_hours": {
+        "start": "22:00",
+        "end": "07:00",
+        "timezone": "America/New_York",
+    },
+}
+
+
+def _read_yaml_dict(path: Path) -> dict:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            data = yaml.safe_load(handle)
+    except (OSError, yaml.YAMLError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def _config_sources(output_path: Path | None) -> list[Path]:
+    """Config files whose brain and usage train must keep, low priority first.
+
+    Tracked ``harvey.yaml`` fills keys the output file does not set, so a
+    local file from an earlier train cannot erase a provider or a usage cap
+    that lives only in the template. The output file itself wins per key.
+    """
+    candidates = [
+        PROJECT_ROOT / "harvey.yaml",
+        Path.cwd() / "harvey.yaml",
+        PROJECT_ROOT / "harvey.local.yaml",
+        Path.cwd() / "harvey.local.yaml",
+    ]
+    if output_path is not None:
+        candidates.append(output_path)
+    sources: list[Path] = []
+    seen: set[Path] = set()
+    for path in candidates:
+        try:
+            resolved = path.resolve()
+        except OSError:
+            continue
+        if resolved in seen or not path.is_file():
+            continue
+        seen.add(resolved)
+        sources.append(resolved)
+    return sources
+
+
+def preserved_runtime_sections(output_path: Path | None = None) -> tuple[dict, dict]:
+    """``(brain, usage)`` merged from the configs train is about to replace."""
+    brain: dict = {}
+    usage: dict = {}
+    for path in _config_sources(output_path):
+        data = _read_yaml_dict(path)
+        section = data.get("brain")
+        if isinstance(section, dict):
+            brain = {**brain, **section}
+        section = data.get("usage")
+        if not isinstance(section, dict):
+            continue
+        quiet = section.get("quiet_hours")
+        prior_quiet = usage.get("quiet_hours")
+        usage = {**usage, **{k: v for k, v in section.items() if k != "quiet_hours"}}
+        if isinstance(quiet, dict):
+            base = prior_quiet if isinstance(prior_quiet, dict) else {}
+            usage["quiet_hours"] = {**base, **quiet}
+    return brain, usage
+
 # Fallback: pages to try if Cloudflare crawl is unavailable
 FALLBACK_PATHS = [
     "/", "/about", "/about-us", "/pricing", "/features", "/product",
@@ -321,10 +449,15 @@ def brain_section(brain_config: BrainConfig) -> dict:
 
 
 class Trainer:
-    def __init__(self, brain_config: BrainConfig | None = None):
+    def __init__(self, brain_config: BrainConfig | None = None, brain_override: bool = False):
         # Without an explicit choice, train with whatever provider the
         # existing config selects (Claude when none does).
+        # brain_override is set when the operator passed --provider/--model.
+        # That selection is written back. Otherwise the on-disk brain block
+        # is kept as-is, which is how a Cursor provider survives a retrain
+        # once that provider exists.
         self.brain_config = brain_config or load_brain_config()
+        self.brain_override = brain_override
         self.state = StateManager()
         self.brain = Brain(self.state, self.brain_config)
         self.scraped_pages: dict[str, str] = {}
@@ -407,13 +540,18 @@ class Trainer:
 
         # Step 6: Generate config + skills
         print("[6/6] Building configuration and product knowledge...")
-        config = self._build_config(product_info, icp_info, objections, domain)
-
         # Write config (relative paths resolve against the project root,
-        # so training works no matter what directory it's launched from)
+        # so training works no matter what directory it's launched from).
+        # Brain and usage are copied from the files on disk (PR #1). ICP,
+        # language, compliance, and channels stay as the operator set them.
         config_path = Path(output_path)
         if not config_path.is_absolute():
             config_path = PROJECT_ROOT / config_path
+        config = self._build_config(
+            product_info, icp_info, objections, domain, output_path=config_path,
+        )
+        existing = _read_yaml(config_path)
+        config = preserve_operator_settings(config, existing)
         with open(config_path, "w") as f:
             yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
@@ -725,8 +863,17 @@ What prospects do instead of buying a solution like ours:
         icp_info: dict,
         objections: dict,
         domain: str,
+        output_path: Path | None = None,
     ) -> dict:
-        """Build the complete harvey.yaml config."""
+        """Build the complete harvey.yaml config.
+
+        Product and persona come from this training run. ``brain`` and
+        ``usage`` are copied from the existing config so a retrain does not
+        drop a provider or ``max_daily_cursor_calls``. An explicit
+        provider/model flag replaces the brain block. ICP, language,
+        compliance, and channels are applied afterwards by
+        ``preserve_operator_settings``.
+        """
         company = product_info.get("company_name", "Your Company")
         product = product_info.get("product_name", "Your Product")
         tone = product_info.get("tone", "professional, consultative, confident")
@@ -767,17 +914,29 @@ What prospects do instead of buying a solution like ours:
                     "max_daily_messages": 10,
                 },
             },
-            "usage": {
-                "max_daily_claude_percent": 80,
-                "heartbeat_interval_minutes": 15,
-                "quiet_hours": {
-                    "start": "22:00",
-                    "end": "07:00",
-                    "timezone": "America/New_York",
-                },
-            },
-            "brain": brain_section(self.brain_config),
+            "usage": self._usage_section(output_path),
+            "brain": self._brain_section_for_write(output_path),
         }
+
+    def _usage_section(self, output_path: Path | None) -> dict:
+        _brain, existing = preserved_runtime_sections(output_path)
+        usage = {**_USAGE_TEMPLATE, **{k: v for k, v in existing.items() if k != "quiet_hours"}}
+        quiet = dict(_USAGE_TEMPLATE["quiet_hours"])
+        if isinstance(existing.get("quiet_hours"), dict):
+            quiet.update(existing["quiet_hours"])
+        usage["quiet_hours"] = quiet
+        return usage
+
+    def _brain_section_for_write(self, output_path: Path | None) -> dict:
+        existing, _usage = preserved_runtime_sections(output_path)
+        if self.brain_override or not existing:
+            return brain_section(self.brain_config)
+        brain = dict(existing)
+        if not brain.get("provider"):
+            brain["provider"] = self.brain_config.provider
+        if not brain.get("model") and self.brain_config.model:
+            brain["model"] = self.brain_config.model
+        return brain
 
 
 async def run_training(url: str, output: str = "harvey.local.yaml", max_pages: int = 100):

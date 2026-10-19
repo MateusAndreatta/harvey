@@ -44,8 +44,25 @@ class Writer:
     def is_native(self) -> bool:
         return self.config.channels.email.provider in NATIVE_PROVIDERS
 
+    def _locale_addon(self) -> str:
+        """Empty unless a non-English language or a compliance regime is set."""
+        from harvey.locale import compliance_note, language_instruction
+        regime = ""
+        compliance = getattr(self.config, "compliance", None)
+        if compliance is not None:
+            regime = getattr(compliance, "regime", "") or ""
+        parts = [
+            language_instruction(getattr(self.config, "language", "en")),
+            compliance_note(regime),
+        ]
+        return "\n".join(p for p in parts if p)
+
     async def run(self):
         """Create email campaigns for prospects that need outreach."""
+        from harvey.locale import email_sending_enabled
+        if not email_sending_enabled(self.config):
+            logger.info("Writer: email sending is off. Lead lists do not need drafts.")
+            return
         logger.info("Writer: Crafting email campaigns...")
 
         # Load foundational skills for this agent
@@ -209,6 +226,9 @@ class Writer:
         ) or ""
         if self.skills:
             prompt += "\n\n" + self.skills
+        extra = self._locale_addon()
+        if extra:
+            prompt += "\n\n" + extra
 
         prompt += f"""
 
@@ -274,6 +294,9 @@ Pricing: {self.config.product.pricing}"""
         # Inject email framework skills
         if self.skills:
             prompt += "\n\n" + self.skills
+        extra = self._locale_addon()
+        if extra:
+            prompt += "\n\n" + extra
 
         prompt += f"""
 

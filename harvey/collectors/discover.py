@@ -24,12 +24,22 @@ import asyncio
 import base64
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from urllib.parse import urlparse
 
 import httpx
 
+from harvey.brands import (
+    NEARBY_KM, brand_key, drop_thin_lead, is_competitor_name,
+    is_distribution_name, is_manufacturer_name, is_segment_reseller, name_key,
+    resellers_excluded,
+)
 from harvey.models import Company
+from harvey.places import (
+    bounding_box, haversine_km, municipality_from_address, reverse_cache_key,
+)
+from harvey.textutil import fold
 
 logger = logging.getLogger("harvey.collectors.discover")
 
@@ -61,6 +71,8 @@ JUNK_DOMAIN_PATTERNS = tuple(re.compile(p, re.I) for p in (
     r"(hospital|healthsystem|medicalcenter)\.",
     r"health\.org$",
     # infrastructure that is never a prospect
+    r"(^|\.)(apontador|telelistas|guiamais|solutudo|hagah|kekanto)\.",
+    r"(^|\.)(cnpj|econodata|casadosdados)\.",
     r"(^|\.)(google|bing|yahoo|duckduckgo|amazon|apple|microsoft)\.",
     r"(wordpress|wix|squarespace|shopify|godaddy|weebly|webflow)\.com$",
 ))
@@ -97,6 +109,8 @@ def is_junk(domain: str, name: str = "") -> bool:
             return True
     if name and any(p.search(name) for p in JUNK_NAME_PATTERNS):
         return True
+    if name and is_competitor_name(name):
+        return True
     return False
 
 
@@ -107,7 +121,20 @@ def is_junk(domain: str, name: str = "") -> bool:
 # the settings table: a given city is looked up once, ever.
 
 NOMINATIM = "https://nominatim.openstreetmap.org/search"
+NOMINATIM_REVERSE = "https://nominatim.openstreetmap.org/reverse"
 GEOCODE_UA = "Harvey/0.1 (open-source sales agent; github.com/ethanplusai/harvey)"
+# Nominatim's usage policy is one request per second. Geocode and reverse
+# share this clock so a discovery run does not burst the same host.
+NOMINATIM_INTERVAL = 1.1
+_last_nominatim = 0.0
+
+
+async def _pace_nominatim():
+    global _last_nominatim
+    wait = NOMINATIM_INTERVAL - (time.monotonic() - _last_nominatim)
+    if wait > 0:
+        await asyncio.sleep(wait)
+    _last_nominatim = time.monotonic()
 
 
 async def geocode_city(state, city: str, radius_km: int = 40,
@@ -124,6 +151,7 @@ async def geocode_city(state, city: str, radius_km: int = 40,
     owned = client is None
     client = client or httpx.AsyncClient(timeout=TIMEOUT)
     try:
+        await _pace_nominatim()
         r = await client.get(
             NOMINATIM,
             params={"q": city, "format": "json", "limit": 1},
@@ -193,6 +221,15 @@ class Business:
     external_id: str = ""            # "<provider>:<stable id>"
     source_url: str = ""
     provider: str = ""
+    # Chain key, coordinates, and producer/retail/competitor. Empty brand
+    # means an independent business and is not collapsed.
+    brand: str = ""
+    latitude: float | None = None
+    longitude: float | None = None
+    kind: str = ""
+    # OSM traits that spread an otherwise identical producer score:
+    # "hours industrial building footprint".
+    traits: str = ""
 
     def identity(self) -> str:
         return self.domain or self.external_id
@@ -482,21 +519,138 @@ class OpenStreetMap(DiscoveryProvider):
         "https://overpass.private.coffee/api/interpreter",
     )
     # Overpass etiquette for a shipped tool: modest volume, no parallelism.
-    MIN_INTERVAL = 2.0
-    BACKOFF = 5.0
+    # Back-to-back queries 0–2s apart come back 502/500; the same query
+    # succeeds after a pause. Space the run, and retry the same mirror
+    # before moving on.
+    MIN_INTERVAL = 30.0
+    BACKOFF = 20.0
+    ATTEMPTS = 2
+    RETRY_BACKOFF = 45.0
+    # 25s made a 40 km query return HTTP 200 with
+    # remark "runtime error: Query timed out" and zero elements. 90s completes.
+    # The HTTP client read timeout has to be longer than this.
+    QUERY_TIMEOUT_S = 90
+    READ_TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
 
     # A friendly term maps to the OSM tags that actually carry those businesses.
+    # Keys are accent-folded stems. One industry may match several stems
+    # ("alimentos e bebidas" is food producers and drink producers). The
+    # original trades stay exclusive: "cosmetic dentist" is a dentist, not
+    # a cosmetics shop. There is no catch-all entry.
+    #
+    # A spec is "key=value" or "key=value|name~regex". Producer tags
+    # (craft, industrial, man_made) are kept ahead of retail shops.
+    _EXCLUSIVE = (
+        "dentist", "lawyer", "attorney", "roof", "plumb", "hvac",
+        "electric", "contractor", "landscap",
+    )
+    # Retail shops dropped when the same query already has a producer tag.
+    # Bakeries and confectioners live as shop=* in OSM, so those stay.
+    _RETAIL_IF_PRODUCER = frozenset({
+        "shop=butcher", "shop=greengrocer", "shop=deli", "shop=dairy",
+        "shop=seafood", "shop=farm", "shop=supermarket", "shop=convenience",
+        "shop=wholesale", "shop=clothes",
+        "shop=chemist", "shop=pharmacy",
+    })
     TAG_MAP = {
-        "roof": ['craft=roofer', 'shop=roofing'],
-        "plumb": ['craft=plumber'],
-        "hvac": ['craft=hvac'],
-        "electric": ['craft=electrician'],
-        "dentist": ['amenity=dentist'],
-        "lawyer": ['office=lawyer'],
-        "attorney": ['office=lawyer'],
-        "contractor": ['craft=builder', 'office=construction_company'],
-        "landscap": ['craft=gardener', 'shop=garden_centre'],
+        "roof": ["craft=roofer", "shop=roofing"],
+        "plumb": ["craft=plumber"],
+        "hvac": ["craft=hvac"],
+        "electric": ["craft=electrician"],
+        "dentist": ["amenity=dentist"],
+        "lawyer": ["office=lawyer"],
+        "attorney": ["office=lawyer"],
+        "contractor": ["craft=builder", "office=construction_company"],
+        "landscap": ["craft=gardener", "shop=garden_centre"],
+        # Food and drink producers. Specific stems before the broader ones.
+        "cervej": ["craft=brewery"],
+        "brewer": ["craft=brewery"],
+        "vinicol": ["craft=winery"],
+        "vineyard": ["craft=winery"],
+        "winery": ["craft=winery"],
+        "adega": ["shop=wine", "craft=winery"],
+        "destil": ["craft=distillery"],
+        "distill": ["craft=distillery"],
+        "cachac": ["craft=distillery"],
+        "confeit": ["craft=confectionery", "shop=confectionery", "shop=pastry"],
+        "confection": ["craft=confectionery", "shop=pastry"],
+        "doceria": ["craft=confectionery", "shop=pastry"],
+        "pastry": ["craft=confectionery", "shop=pastry"],
+        "padaria": ["shop=bakery"],
+        "panific": ["shop=bakery"],
+        "baker": ["shop=bakery"],
+        # Producers, not the butcher and the greengrocer. "alimentos e
+        # bebidas" also matches the drink stems below and the tags are unioned.
+        "alimento": [
+            "craft=bakery", "craft=confectionery", "craft=cheese",
+            "craft=coffee_roaster",
+        ],
+        "food": [
+            "craft=bakery", "craft=confectionery", "craft=cheese",
+            "craft=coffee_roaster",
+        ],
+        "bebida": ["craft=brewery", "craft=winery", "craft=distillery"],
+        "beverage": ["craft=brewery", "craft=winery", "craft=distillery"],
+        # Cosmetics shops and the factories. ``name~cosmet`` alone matched
+        # nothing in a live metro (craft=cosmetics is rare, and plants are
+        # named sabonete, perfume, beleza). The wider regex still skips
+        # every factory in the city. Reseller counters are dropped later,
+        # when exclude_resellers is on, rather than by this query.
+        "cosmet": [
+            "industrial=factory|name~cosmet|perfum|higien|sabon|shampoo|beleza|maquiag",
+            "man_made=works|name~cosmet|perfum|higien|sabon|shampoo|beleza|maquiag",
+            "office=company|name~cosmet|perfum|higien|sabon|shampoo|beleza|maquiag",
+            "craft=cosmetics",
+            "shop=cosmetics",
+            "shop=perfumery",
+        ],
+        "perfum": ["shop=cosmetics", "shop=perfumery"],
+        "higien": [
+            "industrial=factory|name~higien",
+            "man_made=works|name~higien",
+            "office=company|name~higien",
+        ],
+        # Manufacturers, not the C&A. A search that only says "clothes" or
+        # "roupa" still uses the retail tag below.
+        "confecc": ["craft=tailor", "craft=dressmaker"],
+        "vestuar": ["shop=clothes"],
+        "alfaiat": ["craft=tailor"],
+        "costur": ["craft=tailor"],
+        "tailor": ["craft=tailor"],
+        "dressmaker": ["craft=dressmaker", "craft=tailor"],
+        "cloth": ["shop=clothes"],
+        "apparel": ["shop=clothes"],
+        "roupa": ["shop=clothes"],
+        # "manipula" is handled on its own (name filter) so a compounding
+        # pharmacy search does not return every Droga Raia.
+        "drogaria": ["shop=chemist", "shop=pharmacy", "amenity=pharmacy"],
+        "farmac": ["shop=chemist", "shop=pharmacy", "amenity=pharmacy"],
+        "pharmac": ["shop=chemist", "shop=pharmacy", "amenity=pharmacy"],
+        "chemist": ["shop=chemist", "amenity=pharmacy"],
+        # Wholesale is a real shop type. Online-only stores are not: mapping
+        # "e-commerce" here returned Sam's Club. Those terms stay unmapped.
+        "atacad": ["shop=wholesale"],
+        "wholesale": ["shop=wholesale"],
+        "fabrica": ["industrial=factory", "man_made=works"],
+        "factory": ["industrial=factory", "man_made=works"],
+        "industria": ["industrial=factory", "man_made=works"],
+        "manufacture": ["industrial=factory", "man_made=works"],
+        "manufatura": ["industrial=factory", "man_made=works"],
+        "fabricante": ["industrial=factory", "man_made=works"],
     }
+
+    # What the error lists. Stems above are for matching; these are the words
+    # a person would actually type.
+    SUPPORTED_TERMS = (
+        "roofing", "plumber", "hvac", "electrician", "dentist", "lawyer",
+        "contractor", "landscaping",
+        "brewery", "cervejaria", "winery", "vinícola", "distillery", "destilaria",
+        "bakery", "padaria", "confectionery", "confeitaria",
+        "food", "alimentos", "bebidas", "cosmetics", "cosméticos",
+        "clothes", "confecção", "tailor", "alfaiate",
+        "pharmacy", "farmácia", "chemist", "manipulação",
+        "factory", "indústria", "atacado",
+    )
 
     def _tags(self, term: str) -> list[str]:
         """The OSM tags that actually carry this kind of business, or none.
@@ -507,12 +661,49 @@ class OpenStreetMap(DiscoveryProvider):
         studios. A search this source cannot answer has to say so; filling the
         database with plausible-looking junk is far worse than returning
         nothing.
+
+        Matching ignores accents and hyphens, so "vinícola" and "vinicola"
+        hit the same tags. A compound industry unions every stem it contains
+        ("alimentos e bebidas" is breweries and food producers, not only the
+        first word). Exclusive trades still win alone, so "cosmetic dentist"
+        stays a dentist. When a producer tag is in the set, generic retail
+        shops are dropped.
         """
-        low = term.lower()
+        folded = fold(term)
+        if not folded:
+            return []
+        # Compounding pharmacies are a name match, not every pharmacy chain.
+        if "manipula" in folded:
+            return [
+                "amenity=pharmacy|name~manipula",
+                "shop=chemist|name~manipula",
+            ]
+        exclusive = [needle for needle in self._EXCLUSIVE if needle in folded]
+        if exclusive:
+            for needle in self.TAG_MAP:
+                if needle in exclusive:
+                    return list(self.TAG_MAP[needle])
+        found: list[str] = []
+        seen: set[str] = set()
         for needle, tags in self.TAG_MAP.items():
-            if needle in low:
-                return tags
-        return []
+            if needle not in folded:
+                continue
+            for tag in tags:
+                if tag not in seen:
+                    seen.add(tag)
+                    found.append(tag)
+        return self._prefer_producers(found)
+
+    @classmethod
+    def _prefer_producers(cls, tags: list[str]) -> list[str]:
+        """Drop generic retail when the query already names a producer."""
+        producer = any(
+            tag.startswith(("craft=", "industrial=", "man_made="))
+            for tag in tags
+        )
+        if not producer:
+            return tags
+        return [tag for tag in tags if tag.split("|", 1)[0] not in cls._RETAIL_IF_PRODUCER]
 
     async def fetch(self, client, env, query):
         if not query.coordinate:
@@ -523,69 +714,263 @@ class OpenStreetMap(DiscoveryProvider):
         if not tags:
             raise RuntimeError(
                 f"OpenStreetMap has no category for {query.term!r}. It can only "
-                f"search mapped trades ({', '.join(sorted(self.TAG_MAP))}). Use a "
-                f"listings or SERP provider for this one.")
+                f"search mapped trades ({', '.join(self.SUPPORTED_TERMS)}). Use a "
+                f"listings or SERP provider for anything else.")
         lat, lng, radius_km = (query.coordinate.split(",") + ["", "", ""])[:3]
+        try:
+            center_lat = float(lat)
+            center_lng = float(lng)
+        except ValueError:
+            logger.warning("osm: bad coordinate %r", query.coordinate)
+            return []
         radius_m = int(float(radius_km or 25) * 1000)
+        south, west, north, east = bounding_box(center_lat, center_lng, radius_m)
+        # One nwr per tag, named elements only, inside the bbox. ``around:``
+        # on a 40 km radius was the slow query (about 80s). The bbox is the
+        # same search in well under that; distance filtering drops the corners.
         clauses = "".join(
-            f'node[{tag.split("=")[0]}={tag.split("=")[1]}](around:{radius_m},{lat},{lng});'
-            f'way[{tag.split("=")[0]}={tag.split("=")[1]}](around:{radius_m},{lat},{lng});'
-            for tag in tags
+            self._overpass_clause(tag, south, west, north, east) for tag in tags
         )
-        body = f"[out:json][timeout:40];({clauses});out center {query.limit};"
+        body = (
+            f"[out:json][timeout:{self.QUERY_TIMEOUT_S}];"
+            f"({clauses});out center {query.limit};"
+        )
+        started = time.monotonic()
 
-        # Overpass is a free volunteer service and 429s/504s readily under
-        # load. Walk the mirrors, then RAISE: returning [] would make a
-        # throttled run look exactly like a market with no businesses in it.
+        # A timeout comes back as HTTP 200 with a remark and zero elements.
+        # Treating that as an empty market drops the whole city. 5xx and that
+        # remark move on to the next mirror. Still raise if every mirror fails.
         headers = {"User-Agent": "Harvey/0.1 (open-source sales agent; "
                                  "github.com/ethanplusai/harvey)"}
-        r = None
+        payload = None
+        last_error = "no response"
+        # The segment is in every failure line. A 502 on mirror 2 is
+        # otherwise indistinguishable from the query that just succeeded.
+        query_label = query.keyword()
         for i, endpoint in enumerate(self.ENDPOINTS):
             if i:
                 await asyncio.sleep(self.BACKOFF)
-            try:
-                r = await client.post(endpoint, content=body.encode(),
-                                      headers=headers)
-            except httpx.HTTPError as e:
-                logger.warning("osm: %s unreachable (%s)", endpoint, e)
-                continue
-            if r.status_code not in (429, 504):
+            for attempt in range(self.ATTEMPTS):
+                if attempt:
+                    logger.warning(
+                        "osm: %s failed on %r (%s) — waiting %.0fs and "
+                        "retrying the same mirror",
+                        endpoint, query_label, last_error, self.RETRY_BACKOFF,
+                    )
+                    await asyncio.sleep(self.RETRY_BACKOFF)
+                try:
+                    r = await client.post(
+                        endpoint, content=body.encode(), headers=headers,
+                        timeout=self.READ_TIMEOUT,
+                    )
+                except httpx.HTTPError as e:
+                    last_error = str(e)
+                    logger.warning(
+                        "osm: %s unreachable for %r (%s)", endpoint, query_label, e,
+                    )
+                    continue
+                failure = self._overpass_failure(r)
+                if failure:
+                    last_error = failure
+                    logger.warning(
+                        "osm: %s failed on %r (%s)", endpoint, query_label, failure,
+                    )
+                    continue
+                if r.status_code >= 400:
+                    r.raise_for_status()
+                payload = r.json()
                 break
-            logger.warning("osm: %s is throttling (%s) — trying the next mirror",
-                           endpoint, r.status_code)
+            if payload is not None:
+                break
         else:
             raise RuntimeError(
-                "Every public Overpass mirror is throttling right now. This is "
-                "free volunteer infrastructure — wait a few minutes and re-run, "
-                "or use a paid provider for bulk work.")
-        if r is None:
-            raise RuntimeError("Could not reach any Overpass mirror.")
-        r.raise_for_status()
+                "Every public Overpass mirror is throttling or timing out "
+                f"on {query_label!r} ({last_error}). A timed-out query is not "
+                "an empty market. Wait a few minutes and re-run, or use a "
+                "paid provider for bulk work."
+            )
+        if payload is None:
+            raise RuntimeError(f"Could not reach any Overpass mirror ({last_error}).")
 
         out = []
-        for el in r.json().get("elements") or []:
+        for el in payload.get("elements") or []:
             tags = el.get("tags") or {}
             name = tags.get("name") or ""
             if not name:
                 continue
+            kind = self._kind(tags, name, el.get("type") or "")
+            center = el.get("center") or {}
+            try:
+                plat = float(el.get("lat") or center.get("lat"))
+                plon = float(el.get("lon") or center.get("lon"))
+            except (TypeError, ValueError):
+                plat, plon = None, None
+            # A point we can locate has to sit inside the circle. The bbox is
+            # a square, so its corners are outside the radius. An element
+            # with no coordinates is kept: ``around:`` used to imply it was
+            # already inside, and some nodes only carry a center on `out center`.
+            if plat is not None and not self._within_radius(
+                plat, plon, center_lat, center_lng, radius_m,
+            ):
+                continue
             site = tags.get("website") or tags.get("contact:website") or ""
-            city = ", ".join(x for x in (tags.get("addr:city"),
-                                         tags.get("addr:state")) if x)
+            street = " ".join(x for x in (
+                tags.get("addr:housenumber"), tags.get("addr:street"),
+                tags.get("addr:suburb"),
+            ) if x)
+            # addr:city only. A blank location is resolved later by a cached
+            # reverse geocode. The nearest town center is the wrong city for
+            # a factory on the Curitiba side of the Araucária line.
+            location = self.place_label(
+                tags.get("addr:city") or "", tags.get("addr:state") or "",
+                plat, plon,
+            )
             out.append(Business(
                 name=name,
                 domain=normalize_domain(site),
                 website=site,
                 phone=tags.get("phone") or tags.get("contact:phone") or "",
-                address=" ".join(x for x in (tags.get("addr:housenumber"),
-                                             tags.get("addr:street")) if x),
-                location=city or query.location,
-                category=tags.get("craft") or tags.get("shop") or tags.get("office") or "",
+                address=street,
+                location=location,
+                category=query.term or tags.get("craft") or tags.get("shop")
+                or tags.get("office") or "",
                 has_website=bool(site),
                 external_id=f"osm:{el.get('type')}/{el.get('id')}",
                 source_url=f"https://www.openstreetmap.org/{el.get('type')}/{el.get('id')}",
                 provider=self.key,
+                brand=brand_key(
+                    name, tags.get("brand") or "", tags.get("brand:wikidata") or "",
+                ),
+                latitude=plat,
+                longitude=plon,
+                kind=kind,
+                traits=self._traits(tags, el.get("type") or ""),
             ))
+        logger.info(
+            "osm: %s — %d named places in %.1fs",
+            query.keyword(), len(out), time.monotonic() - started,
+        )
         return out
+
+    @staticmethod
+    def _overpass_failure(response) -> str:
+        """Why this mirror's answer cannot be used, or "" when it can.
+
+        HTTP 200 plus ``remark: runtime error: Query timed out`` is a failure
+        with an empty element list. 5xx and 429 are failures too.
+        """
+        if response.status_code >= 500 or response.status_code in (408, 429):
+            return f"HTTP {response.status_code}"
+        if response.status_code != 200:
+            return ""
+        try:
+            payload = response.json()
+        except Exception:
+            return "response was not JSON"
+        remark = str(payload.get("remark") or "")
+        lowered = remark.lower()
+        if "timed out" in lowered or "runtime error" in lowered:
+            return remark
+        return ""
+
+    @staticmethod
+    def _overpass_clause(spec: str, south: float, west: float,
+                         north: float, east: float) -> str:
+        body, _, name_rx = spec.partition("|name~")
+        key, _, value = body.partition("=")
+        # A name regex already requires a name. Otherwise ask Overpass to
+        # skip unnamed elements instead of downloading them.
+        name_filter = f'["name"~"{name_rx}",i]' if name_rx else '["name"]'
+        return (
+            f'nwr["{key}"="{value}"]{name_filter}'
+            f"({south:.5f},{west:.5f},{north:.5f},{east:.5f});"
+        )
+
+    @staticmethod
+    def _within_radius(lat: float, lon: float, center_lat: float,
+                       center_lng: float, radius_m: int) -> bool:
+        return haversine_km(lat, lon, center_lat, center_lng) * 1000 <= radius_m
+
+    @staticmethod
+    def place_label(addr_city: str, addr_state: str, lat, lon) -> str:
+        """addr:city when OSM has it. Otherwise blank, for a reverse geocode.
+
+        ``lat`` and ``lon`` are unused on purpose. Nearest-centroid used to
+        fill this and assigned CIC factories to Araucária and São José dos
+        Pinhais.
+        """
+        del lat, lon
+        city = (addr_city or "").strip()
+        state = (addr_state or "").strip()
+        if city:
+            return ", ".join(part for part in (city, state) if part)
+        return ""
+
+    @staticmethod
+    def _traits(tags: dict, element_type: str) -> str:
+        """Hours, industrial land use, an industrial building, a mapped area."""
+        parts = []
+        if tags.get("opening_hours"):
+            parts.append("hours")
+        landuse = tags.get("landuse") or ""
+        if tags.get("industrial") or landuse in ("industrial", "brownfield", "port"):
+            parts.append("industrial")
+        if (tags.get("building") or "") in (
+            "industrial", "warehouse", "factory", "manufacture",
+        ):
+            parts.append("building")
+        if element_type in ("way", "relation"):
+            parts.append("footprint")
+        return " ".join(parts)
+
+    # industrial=warehouse / depot is a shed, not a plant. A brand pin
+    # (a node named Coca Cola, no factory tag) is not one either.
+    _PRODUCTION_INDUSTRIAL = frozenset({"factory", "manufacture", "plant"})
+
+    @staticmethod
+    def _kind(tags: dict, name: str, element_type: str = "") -> str:
+        if is_competitor_name(name) or tags.get("craft") in ("printer", "printmaker"):
+            return "competitor"
+        if tags.get("shop") in ("copyshop", "printer"):
+            return "competitor"
+        segment = " ".join(
+            part for part in (
+                tags.get("shop"), tags.get("craft"), tags.get("office"),
+            ) if part
+        )
+        if OpenStreetMap._is_producer(tags, name, element_type):
+            kind = "producer"
+        elif tags.get("shop") or tags.get("amenity"):
+            kind = "retail"
+        else:
+            kind = ""
+        if is_segment_reseller(name, segment, kind):
+            return "reseller"
+        return kind
+
+    @classmethod
+    def _is_producer(cls, tags: dict, name: str, element_type: str) -> bool:
+        """A plant, not a distribution center or a brand pin.
+
+        ``industrial=warehouse`` and ``man_made=works`` on a node with no
+        factory tag are how a Centro de Distribuição and a Coca Cola point
+        were scored as producers. A mapped area (way or relation) with
+        ``man_made=works`` still is a plant, and so is any craft or a name
+        that says fábrica.
+        """
+        if is_distribution_name(name):
+            return False
+        industrial = tags.get("industrial") or ""
+        if industrial in cls._PRODUCTION_INDUSTRIAL:
+            return True
+        if is_manufacturer_name(name):
+            return True
+        craft = tags.get("craft") or ""
+        if craft and craft not in ("printer", "printmaker"):
+            return True
+        works = tags.get("man_made") in ("works", "factory")
+        # A node with only man_made=works is a pin. Brand points land here.
+        return bool(works and element_type != "node")
 
 
 PROVIDERS: dict[str, DiscoveryProvider] = {
@@ -773,11 +1158,25 @@ async def run_discovery(
 
                 report.found += len(found)
                 batch = []
+                drop_resellers = resellers_excluded(config)
                 for biz in found:
-                    if is_junk(biz.domain, biz.name):
+                    if (
+                        is_junk(biz.domain, biz.name)
+                        or biz.kind == "competitor"
+                        or drop_thin_lead(
+                            biz.name, biz.phone, biz.website, biz.address, biz.domain,
+                        )
+                        or (
+                            drop_resellers and is_segment_reseller(
+                                biz.name, query.term or biz.category, biz.kind,
+                            )
+                        )
+                    ):
                         report.junk += 1
                         continue
-                    ident = biz.identity()
+                    # One row per chain. The brand key is stable across
+                    # branches that have no website and therefore no domain.
+                    ident = biz.brand or biz.identity()
                     if not ident or ident in seen:
                         continue
                     seen.add(ident)
@@ -808,28 +1207,162 @@ async def run_discovery(
     return report
 
 
+def _metro_label(value: str) -> bool:
+    """True when the text is the search area, not a municipality."""
+    folded = fold(value)
+    return "metropolit" in folded or folded in {"rmc", "rmsp"}
+
+
+async def _company_with_chain(state, chain: str):
+    """A row already stored under this chain, even if its brand key is wikidata."""
+    for company in await state.list_companies():
+        if company.brand == chain or brand_key(company.name) == chain:
+            return company
+    return None
+
+
+async def _nearby_same_name(state, biz: Business):
+    """Same normalized name within NEARBY_KM. HORSCH twice, 200 m apart."""
+    key = name_key(biz.name)
+    if not key or biz.latitude is None or biz.longitude is None:
+        return None
+    for company in await state.list_companies():
+        if name_key(company.name) != key:
+            continue
+        if company.latitude is None or company.longitude is None:
+            continue
+        dist = haversine_km(
+            biz.latitude, biz.longitude, company.latitude, company.longitude,
+        )
+        if dist <= NEARBY_KM:
+            return company
+    return None
+
+
+async def _reverse_municipality(state, lat: float, lon: float,
+                               client: httpx.AsyncClient | None = None) -> str:
+    """Cached Nominatim reverse geocode at zoom 10. '' when it misses.
+
+    Zoom 10 is the municipality, not the suburb. The cache is one cell per
+    point (five decimal places). A miss is cached; a transport error is not,
+    so the next run can try again. There is no nearest-town fallback.
+    """
+    cache_key = reverse_cache_key(lat, lon)
+    cached = await state.get_setting(cache_key)
+    if cached:
+        if cached == "-":
+            return ""
+        city, _, uf = cached.partition("|")
+        return ", ".join(part for part in (city, uf) if part)
+
+    owned = client is None
+    client = client or httpx.AsyncClient(timeout=TIMEOUT)
+    try:
+        await _pace_nominatim()
+        r = await client.get(
+            NOMINATIM_REVERSE,
+            params={
+                "lat": f"{lat:.5f}", "lon": f"{lon:.5f}",
+                "format": "json", "zoom": 10, "addressdetails": 1,
+            },
+            headers={
+                "User-Agent": GEOCODE_UA,
+                "Accept-Language": "pt-BR",
+            },
+        )
+        r.raise_for_status()
+        payload = r.json()
+    except Exception as e:
+        logger.warning("reverse geocode failed at %.5f,%.5f: %s", lat, lon, e)
+        return ""
+    finally:
+        if owned:
+            await client.aclose()
+
+    city, uf = municipality_from_address(payload.get("address") or {})
+    if not city:
+        await state.set_setting(cache_key, "-")
+        return ""
+    await state.set_setting(cache_key, f"{city}|{uf}")
+    return ", ".join(part for part in (city, uf) if part)
+
+
 async def _upsert(state, biz: Business, query: DiscoveryQuery) -> tuple[str, bool]:
     """Record the business, returning (id, was_new)."""
     # Look before inserting, so "already knew this one" is a fact we report
     # rather than something inferred from an insert's return value.
+    if not biz.location and biz.latitude is not None and biz.longitude is not None:
+        biz.location = await _reverse_municipality(state, biz.latitude, biz.longitude)
     existing = None
-    if biz.domain:
+    if biz.brand:
+        existing = await state.get_company_by_brand(biz.brand)
+    if existing is None and biz.brand.startswith("chain:"):
+        existing = await _company_with_chain(state, biz.brand)
+    if existing is None and biz.domain:
         existing = await state.get_company_by_domain(biz.domain)
     if existing is None and biz.external_id:
         existing = await state.get_company_by_external_id(biz.external_id)
+    if existing is None:
+        existing = await _nearby_same_name(state, biz)
     if existing:
+        fill = {}
+        if biz.website and not existing.website:
+            fill["website"] = biz.website
+        if biz.domain and not existing.domain:
+            fill["domain"] = biz.domain
+        if biz.phone and not existing.phone:
+            fill["phone"] = biz.phone
+        # Refresh classification. A brand pin stored as a producer, or a
+        # distribution center, has to be able to lose that kind.
+        if biz.kind != (existing.kind or ""):
+            fill["kind"] = biz.kind
+        if biz.latitude is not None and existing.latitude is None:
+            fill["latitude"] = biz.latitude
+            fill["longitude"] = biz.longitude
+        if biz.brand.startswith("chain:") and (existing.brand or "").startswith("wd:"):
+            fill["brand"] = biz.brand
+        # brand:votorantim was a corporate tag treated as a retail chain.
+        # A rediscover with no chain key clears it.
+        if (existing.brand or "").startswith("brand:") and not biz.brand:
+            fill["brand"] = ""
+        new_city = (biz.location or "").split(",")[0].strip()
+        # Replace a neighbour assigned by the old centroid guess, not only
+        # a blank or a metro label.
+        if new_city and not _metro_label(new_city) and new_city != (existing.city or "").strip():
+            fill["city"] = new_city
+        if fill:
+            await state.update_company_lead(existing.id, **fill)
+        if biz.traits:
+            await state.update_company_signals(existing.id, new_signals=[{
+                "type": "osm_traits", "detail": biz.traits,
+            }])
         return existing.id, False
 
+    place = biz.location
+    if not place and query.location and not _metro_label(query.location):
+        place = query.location
+    signals = []
+    if biz.traits:
+        signals.append({"type": "osm_traits", "detail": biz.traits})
     company = Company(
         name=biz.name,
         domain=biz.domain,
         website=biz.website,
         phone=biz.phone,
-        industry=biz.category or query.term,
-        location=biz.location or query.location,
+        address=biz.address,
+        city=(place.split(",")[0].strip() if place else ""),
+        # The search term is the segment ("cervejaria"), which is what a
+        # lead list filters on. The OSM tag value is a fallback.
+        industry=query.term or biz.category,
+        location=place,
         source=f"discover:{biz.provider}",
         source_url=biz.source_url,
         external_id=biz.external_id,
+        brand=biz.brand,
+        latitude=biz.latitude,
+        longitude=biz.longitude,
+        kind=biz.kind,
+        signals=signals,
     )
     return await state.add_company(company), True
 

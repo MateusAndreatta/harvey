@@ -38,6 +38,8 @@ from bs4 import BeautifulSoup
 from harvey.brain import Brain
 from harvey.config import HarveyConfig, EnvConfig
 from harvey.integrations.email_finder import find_email
+from harvey.locale import language_instruction
+from harvey.scoring import is_owner_or_buyer, pick_best_contact, score_company, title_matches
 from harvey.integrations.linkedin import LinkedInAutomation
 from harvey.models.company import Company
 from harvey.models.prospect import Prospect
@@ -91,11 +93,29 @@ _BLOCK_MARKERS = (
     "/sorry/index",
 )
 
+def _person_from_observation(text: str) -> tuple[str, str, str] | None:
+    """'João da Silva — Sócio-fundador' -> (first, last, title)."""
+    raw = (text or "").strip()
+    if "—" in raw:
+        name, _, title = raw.partition("—")
+    elif " - " in raw:
+        name, _, title = raw.partition(" - ")
+    else:
+        return None
+    name, title = name.strip(), title.strip()
+    parts = [p for p in name.split() if p]
+    if len(parts) < 2 or not title:
+        return None
+    return parts[0], " ".join(parts[1:]), title
+
+
 # Seniority / title vocabulary reused for ICP heuristics.
 _SENIOR_KEYWORDS = (
     "ceo", "cto", "cfo", "cmo", "coo", "cro", "chief", "founder",
     "co-founder", "president", "owner", "partner", "vp", "vice president",
     "svp", "evp", "head of", "director",
+    "socio", "sócio", "proprietario", "proprietário", "dono", "fundador",
+    "diretor", "gerente", "comprador", "compras",
 )
 
 
@@ -122,6 +142,10 @@ class Scout:
         logger.info("Scout: Starting prospecting cycle...")
 
         self.skills = self.brain.load_skills_for_agent("scout")
+        try:
+            await self._import_profile_contacts()
+        except Exception as e:
+            logger.warning(f"Scout: could not import profile contacts: {e}")
         self._queries_this_cycle = 0
         self._seen_prospect_keys = set()
         self._seen_domains = set()
@@ -155,6 +179,10 @@ class Scout:
             except Exception as e:
                 logger.warning(f"Scout: strategy '{name}' failed: {e}")
 
+        try:
+            await self._score_all_companies()
+        except Exception as e:
+            logger.warning(f"Scout: company scoring failed: {e}")
         await self.state.log_action(
             action_type="prospect",
             agent="scout",
@@ -207,7 +235,11 @@ class Scout:
         headers = {
             "User-Agent": random.choice(USER_AGENTS),
             "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Language": (
+                "pt-BR,pt;q=0.9,en;q=0.5"
+                if getattr(self.config, "language", "en") == "pt-BR"
+                else "en-US,en;q=0.9"
+            ),
         }
         if extra:
             headers.update(extra)
@@ -620,6 +652,8 @@ class Scout:
                 logger.debug(f"mark_prospects_checked failed for {domain}: {e}")
 
             for prospect in contacts:
+                if not prospect.score:
+                    prospect.score = self._heuristic_score(prospect)
                 await self.state.add_prospect(prospect)
                 count += 1
                 logger.info(
@@ -630,6 +664,111 @@ class Scout:
                     return count
 
         return count
+
+    async def score_lead_list(self, scrape: bool = True) -> dict:
+        """Turn discovered companies into a scored lead list.
+
+        No mailbox and no model call. Profile observations become contacts,
+        sites that have not been read for people get one pass, then every
+        company gets an ICP score and a short reason.
+        """
+        imported = await self._import_profile_contacts()
+        scraped = 0
+        if scrape:
+            scraped = await self._prospect_via_known_companies()
+        scored = await self._score_all_companies()
+        logger.info(
+            f"Scout: lead list — {imported} contact(s) from profiles, "
+            f"{scraped} from sites, {scored} companies scored."
+        )
+        return {"imported": imported, "scraped": scraped, "scored": scored}
+
+    async def _import_profile_contacts(self) -> int:
+        """Create prospects from people the profiler already named."""
+        created = 0
+        try:
+            companies = await self.state.list_companies()
+        except Exception as e:
+            logger.debug(f"list_companies failed: {e}")
+            return 0
+        for company in companies:
+            try:
+                observations = await self.state.get_observations(
+                    company_id=company.id, limit=40,
+                )
+            except Exception as e:
+                logger.debug(f"observations failed for {company.id}: {e}")
+                continue
+            seen_names = set()
+            for obs in observations:
+                if obs.get("signal_code") not in ("DECISION_MAKER_TITLE", "CONTACT_FOUND"):
+                    continue
+                parsed = _person_from_observation(obs.get("value_text") or "")
+                if not parsed:
+                    continue
+                first, last, title = parsed
+                key = (first.lower(), last.lower())
+                if key in seen_names:
+                    continue
+                if not (self._title_matches_icp(title) or is_owner_or_buyer(title)):
+                    continue
+                seen_names.add(key)
+                prospect = Prospect(
+                    first_name=first,
+                    last_name=last,
+                    title=title[:120],
+                    company=company.name,
+                    company_id=company.id,
+                    industry=company.industry,
+                    seniority=self._infer_seniority(title),
+                    source="profile",
+                    source_url=obs.get("evidence_url") or company.website or "",
+                    phone=company.phone or "",
+                )
+                prospect.score = self._heuristic_score(prospect)
+                if await self._is_duplicate_prospect(prospect):
+                    continue
+                await self.state.add_prospect(prospect)
+                self._remember_prospect(prospect)
+                created += 1
+        return created
+
+    async def _score_all_companies(self) -> int:
+        """Write icp_score and icp_reason on every company. No model call."""
+        companies = await self.state.list_companies()
+        prospects = await self.state.list_prospects()
+        by_company: dict[str, list] = {}
+        for prospect in prospects:
+            if prospect.company_id:
+                by_company.setdefault(prospect.company_id, []).append(prospect)
+            if not prospect.score:
+                try:
+                    await self.state.update_prospect_score(
+                        prospect.id, self._heuristic_score(prospect),
+                    )
+                except Exception as e:
+                    logger.debug(f"prospect score update failed: {e}")
+        portuguese = getattr(self.config, "language", "en") == "pt-BR"
+        scored = 0
+        for company in companies:
+            score, reason = score_company(company, self.config)
+            best = pick_best_contact(by_company.get(company.id) or [])
+            if best is not None:
+                if is_owner_or_buyer(best.title):
+                    score = min(100, score + 5)
+                who = best.full_name()
+                if portuguese:
+                    reason = f"{reason} Contato: {who} ({best.title})."
+                else:
+                    reason = f"{reason} Contact: {who} ({best.title})."
+            try:
+                await self.state.update_company_lead(
+                    company.id, icp_score=score, icp_reason=reason[:500],
+                )
+                scored += 1
+            except Exception as e:
+                logger.debug(f"company score update failed for {company.id}: {e}")
+        return scored
 
     # ── Strategy 1: LinkedIn ──
 
@@ -1124,6 +1263,7 @@ class Scout:
                 f"Seniority: {c.seniority or 'unknown'}."
             )
 
+        language_line = language_instruction(getattr(self.config, "language", "en"))
         prompt = f"""You are analyzing a batch of sales prospects that have already been found and verified.
 Your job is to score each one (1-100) based on how well they match the ICP, and add a short personalization note.
 
@@ -1144,7 +1284,8 @@ Score criteria:
 - 40-59: Partial match, might be worth a shot
 - 1-39: Poor match, probably skip
 
-Respond ONLY with the JSON array."""
+Respond ONLY with the JSON array.
+{language_line}"""
 
         try:
             result = await self.brain.think_json(
@@ -1316,8 +1457,8 @@ Respond ONLY with the JSON array."""
 
     async def _scrape_team_page(self, domain: str) -> list[dict]:
         """Try to find and scrape a company's team/about page."""
-        team_paths = ["/team", "/about", "/about-us", "/our-team", "/people",
-                      "/leadership", "/about/team", "/company/team", "/staff"]
+        from harvey.collectors.profile import TEAM_PATHS, people_from_html
+        team_paths = TEAM_PATHS
         members = []
 
         base, _ = await self._resolve_base_url(domain)
@@ -1337,6 +1478,17 @@ Respond ONLY with the JSON array."""
             # Harvest any real address on the page — one confirmed email
             # reveals the domain's whole pattern (learned once, reused free).
             await self._learn_pattern_from_page(soup, resp.text, domain)
+
+            for person in people_from_html(resp.text):
+                if not person.get("first_name") or not person.get("last_name"):
+                    continue
+                members.append({
+                    "first_name": person["first_name"],
+                    "last_name": person["last_name"],
+                    "title": (person.get("title") or "")[:120],
+                })
+            if members:
+                break
 
             try:
                 cards = soup.select(
@@ -1365,7 +1517,7 @@ Respond ONLY with the JSON array."""
                     continue
                 if any(ch.isdigit() for ch in name):
                     continue
-                if not re.match(r"^[A-Za-z][A-Za-z.'\- ]+$", name):
+                if not re.match(r"^[\w'.\-]+(?:\s+[\w'.\-]+)+$", name, re.UNICODE):
                     continue
 
                 parts = name.split(" ", 1)
@@ -1411,7 +1563,7 @@ Respond ONLY with the JSON array."""
         contacts: list[Prospect] = []
         for member in team_members:
             title = member.get("title", "")
-            if not self._title_matches_icp(title):
+            if not (self._title_matches_icp(title) or is_owner_or_buyer(title)):
                 continue
 
             first_name = member.get("first_name", "")
@@ -1638,7 +1790,8 @@ Respond ONLY with the JSON array."""
         return note[:400]
 
     _CAREERS_PATHS = ("/careers", "/jobs", "/careers/", "/join-us", "/join",
-                      "/about/careers", "/company/careers", "/work-with-us")
+                      "/about/careers", "/company/careers", "/work-with-us",
+                      "/trabalhe-conosco", "/vagas", "/carreiras")
 
     async def _scrape_hiring_signals(self, domain: str) -> list[str]:
         """Scan the company's careers page for open roles matching our
@@ -1811,30 +1964,28 @@ Respond ONLY with the JSON array."""
         """Check if a job title matches the ICP target titles."""
         if not title:
             return False
-        title_lower = title.lower()
         if self.config.icp.titles:
-            for target in self.config.icp.titles:
-                t = target.lower().strip()
-                if t and t in title_lower:
-                    return True
-            return False
+            return title_matches(title, list(self.config.icp.titles))
         # No explicit ICP titles → fall back to any senior title.
-        return any(kw in title_lower for kw in _SENIOR_KEYWORDS)
+        return title_matches(title, list(_SENIOR_KEYWORDS))
 
     def _infer_seniority(self, title: str) -> str:
         """Infer seniority level from a job title."""
         if not title:
             return ""
-        t = title.lower()
-        if any(kw in t for kw in ["ceo", "cto", "cfo", "cmo", "coo", "cro",
-                                  "chief", "founder", "co-founder", "owner",
-                                  "president"]) and "vice president" not in t:
+        from harvey.textutil import fold as _fold_title
+        t = _fold_title(title)
+        if any(kw in t for kw in (
+            "ceo", "cto", "cfo", "cmo", "coo", "cro", "chief", "founder",
+            "cofounder", "owner", "president", "socio", "proprietario",
+            "dono", "fundador",
+        )) and "vice president" not in t and "vicepresident" not in t:
             return "c_suite"
-        if any(kw in t for kw in ["vp", "vice president", "svp", "evp", "head of"]):
+        if any(kw in t for kw in ("vp", "vice president", "vicepresident", "svp", "evp", "head of")):
             return "vp"
-        if "director" in t:
+        if any(kw in t for kw in ("director", "diretor")):
             return "director"
-        if any(kw in t for kw in ["manager", "team lead", "lead "]):
+        if any(kw in t for kw in ("manager", "gerente", "comprador", "compras", "team lead", "lead ")):
             return "manager"
         return "individual"
 

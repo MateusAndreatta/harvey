@@ -108,7 +108,7 @@ class Brain:
 
     @property
     def provider_label(self) -> str:
-        return PROVIDER_LABELS[self.provider]
+        return PROVIDER_LABELS.get(self.provider, self.provider)
 
     @property
     def paused_reason(self) -> str:

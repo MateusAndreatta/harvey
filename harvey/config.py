@@ -10,6 +10,7 @@ import yaml
 from dotenv import load_dotenv
 from pydantic import BaseModel, ValidationError, field_validator, model_validator
 
+from harvey.locale import normalize_language, normalize_regime
 from harvey.paths import PROJECT_ROOT
 
 logger = logging.getLogger("harvey.config")
@@ -66,6 +67,9 @@ class ICPConfig(BaseModel):
     #   "Denver, CO": "39.7392,-104.9903,50"
     # Without one, listings providers can only match on the business name.
     geo_coordinates: dict[str, str] = {}
+    # Leave consultant and franchise counters (Mary Kay, "Aqui tem Natura",
+    # O Boticário) out of a cosmetics list. A manufacturer stays.
+    exclude_resellers: bool = True
 
 
 class EmailChannelConfig(BaseModel):
@@ -154,7 +158,23 @@ class PreclearedConfig(BaseModel):
 
 
 class ComplianceConfig(BaseModel):
+    """Which cold-email rules Harvey should follow when mail is turned on.
+
+    Empty means the standing rules already in the skills (CAN-SPAM, GDPR/PECR,
+    CASL) with no extra prompt. ``br`` is Brazil's LGPD: legitimate interest
+    for relevant B2B contact, sender identification, a clear descadastro, and
+    that request honored. Lead-list mode does not send, so this only changes
+    copy when email is enabled.
+    """
+
     precleared: PreclearedConfig = PreclearedConfig()
+    # "" | us | uk | eu | ca | br. Aliases: lgpd, can-spam, pecr, gdpr, casl.
+    regime: str = ""
+
+    @field_validator("regime", mode="before")
+    @classmethod
+    def _regime(cls, v) -> str:
+        return normalize_regime(v)
 
 
 class QuietHoursConfig(BaseModel):
@@ -265,6 +285,13 @@ class HarveyConfig(BaseModel):
     usage: UsageConfig = UsageConfig()
     brain: BrainConfig = BrainConfig()
     compliance: ComplianceConfig = ComplianceConfig()
+    # en (default) or pt-BR. Affects scoring reasons and signal labels.
+    language: str = "en"
+
+    @field_validator("language", mode="before")
+    @classmethod
+    def _language(cls, v) -> str:
+        return normalize_language(v)
 
 
 class EnvConfig(BaseModel):

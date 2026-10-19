@@ -137,7 +137,12 @@
 
 <!-- Companies -->
 <div id="companies" class="section">
-  <div class="section-head"><h2>Companies</h2><p>Organizations Harvey has researched. Click a row to see its contacts.</p></div>
+  <div class="section-head" style="display:flex;align-items:flex-end;justify-content:space-between;gap:16px">
+    <div><h2>Companies</h2><p>Organizations Harvey has researched. Click a row to see its contacts.</p></div>
+    <div style="flex-shrink:0">
+      <a class="btn btn-primary btn-sm" href="/api/export/leads.csv" download>Export lead list</a>
+    </div>
+  </div>
   <div id="companies-list"></div>
 </div>
 
@@ -146,6 +151,7 @@
   <div class="section-head" style="display:flex;align-items:flex-end;justify-content:space-between;gap:16px">
     <div><h2>Contacts</h2><p>People Harvey has found and verified.</p></div>
     <div style="display:flex;gap:8px;flex-shrink:0">
+      <a class="btn btn-primary btn-sm" href="/api/export/leads.csv" download>Export lead list</a>
       <a class="btn btn-secondary btn-sm" href="/api/export/prospects.csv" download>Export deliverable CSV</a>
       <a class="btn btn-secondary btn-sm" href="/api/export/prospects.csv?all=true" download>Export all</a>
     </div>
