@@ -77,6 +77,11 @@ def _check_codex_cli() -> bool:
     return shutil.which("codex") is not None
 
 
+def _check_cursor_cli() -> bool:
+    """Check if the Cursor CLI (cursor-agent) is installed."""
+    return shutil.which("cursor-agent") is not None
+
+
 async def _test_claude(brain: Brain) -> bool:
     """Test that the configured brain answers (Claude or Codex)."""
     response = await brain.think(
@@ -91,8 +96,9 @@ def _ask_brain_config() -> BrainConfig:
     _print_harvey("I think with an AI subscription you already pay for:")
     print("    claude — your Claude plan, via Claude Code (default)")
     print("    codex  — your ChatGPT plan, via the Codex CLI")
+    print("    cursor — your Cursor plan, via the Cursor CLI")
     while True:
-        provider = _ask("Which one? (claude/codex)", default="claude").lower()
+        provider = _ask("Which one? (claude/codex/cursor)", default="claude").lower()
         if provider == "codex":
             from harvey.codex import CodexError, require_supported_platform
             try:
@@ -100,16 +106,22 @@ def _ask_brain_config() -> BrainConfig:
             except CodexError as e:
                 print(f"    ({e})")
                 continue
-        if provider in ("claude", "codex"):
+        if provider in ("claude", "codex", "cursor"):
             break
-        print("    (type claude or codex)")
+        print("    (type claude, codex, or cursor)")
     if provider == "codex":
         from harvey.codex import SUGGESTED_MODEL
         print(f"    {SUGGESTED_MODEL} is the Codex model Harvey has verified as text-only")
         print("    (no code-execution tools). Press Enter to use it, or type another.")
+    elif provider == "cursor":
+        from harvey.cursor_cli import SUGGESTED_MODEL as CURSOR_MODEL
+        print(f"    {CURSOR_MODEL} is included in Cursor plans. Press Enter to use it,")
+        print("    or type another model id.")
     while True:
         if provider == "codex":
             model = _ask("Model", default=SUGGESTED_MODEL, required=False)
+        elif provider == "cursor":
+            model = _ask("Model", default=CURSOR_MODEL, required=False)
         else:
             model = _ask("Model (leave blank for the default)", required=False)
         try:
@@ -190,6 +202,8 @@ class SetupWizard:
         self.brain_config = _ask_brain_config()
         if self.brain_config.provider == "codex":
             await self._check_codex()
+        elif self.brain_config.provider == "cursor":
+            await self._check_cursor()
         else:
             await self._check_claude()
 
@@ -267,6 +281,44 @@ class SetupWizard:
             print("✗ Failed")
             _print_harvey("Codex is installed but the test call failed. The log")
             _print_harvey("above says why (login, plan limits, or isolation).")
+            if not _ask_yes_no("Continue anyway?", default=False):
+                raise SystemExit(1)
+        self._check_python_packages()
+
+    async def _check_cursor(self):
+        from harvey.cursor_cli import INSTALL_HINT, CursorClient, CursorError
+
+        print("\n  Checking Cursor CLI...", end=" ")
+        if _check_cursor_cli():
+            print("✓ Found")
+        else:
+            print("✗ Not found")
+            _print_harvey("I need the Cursor CLI to think with your Cursor plan:")
+            print(f"         {INSTALL_HINT}")
+            print("\n         Then run 'cursor-agent login', or set CURSOR_API_KEY,")
+            print("         and re-run this setup.")
+            raise SystemExit(1)
+
+        print("  Checking Cursor login...", end=" ", flush=True)
+        try:
+            await CursorClient(model=self.brain_config.model).preflight()
+            print("✓ Ready")
+        except CursorError as e:
+            print("✗ Not ready")
+            _print_harvey(str(e))
+            raise SystemExit(1)
+
+        # A real call through the same text-only runtime Harvey uses later.
+        print("  Testing Cursor (ask mode, no tools)...", end=" ", flush=True)
+        state = StateManager()
+        await state.init_db()
+        brain = Brain(state, self.brain_config)
+        if await _test_claude(brain):
+            print("✓ Working")
+        else:
+            print("✗ Failed")
+            _print_harvey("Cursor is installed but the test call failed. The log")
+            _print_harvey("above says why (login, plan limits, or a tool call).")
             if not _ask_yes_no("Continue anyway?", default=False):
                 raise SystemExit(1)
         self._check_python_packages()
@@ -382,7 +434,7 @@ class SetupWizard:
             _print_harvey("and learn everything I can about your product.\n")
 
             from harvey.trainer import Trainer
-            trainer = Trainer(brain_config=self.brain_config)
+            trainer = Trainer(brain_config=self.brain_config, brain_override=True)
             self.config = await trainer.train(url, str(CONFIG_FILE)) or {}
 
             if self.config:
@@ -544,6 +596,16 @@ class SetupWizard:
             print("    (didn't catch that — using 80)")
             usage_pct = 80.0
 
+        cursor_cap = 200
+        if self.brain_config.provider == "cursor":
+            print("\n  Cursor has no live quota API, so I count my own calls.")
+            raw_cap = _ask("Max Cursor calls I can make per day", default="200")
+            try:
+                cursor_cap = max(0, int(raw_cap))
+            except ValueError:
+                print("    (didn't catch that — using 200)")
+                cursor_cap = 200
+
         # Heartbeat interval
         print("\n  I wake up on a schedule to check for work.")
         interval = _ask(
@@ -580,6 +642,7 @@ class SetupWizard:
         if self.config:
             self.config["usage"] = {
                 "max_daily_claude_percent": usage_pct,
+                "max_daily_cursor_calls": cursor_cap,
                 "heartbeat_interval_minutes": interval,
                 "quiet_hours": {
                     "start": quiet_start,
@@ -657,10 +720,14 @@ class SetupWizard:
 """)
 
         # Show what's configured
+        if self.brain_config.provider == "codex":
+            brain_check = ("Codex CLI (ChatGPT plan)", _check_codex_cli())
+        elif self.brain_config.provider == "cursor":
+            brain_check = ("Cursor CLI (Cursor plan)", _check_cursor_cli())
+        else:
+            brain_check = ("Claude Code CLI", _check_claude_cli())
         checks = {
-            ("Codex CLI (ChatGPT plan)" if self.brain_config.provider == "codex"
-             else "Claude Code CLI"): (_check_codex_cli() if self.brain_config.provider == "codex"
-                                      else _check_claude_cli()),
+            brain_check[0]: brain_check[1],
             "Instantly API": bool(self.env_vars.get("INSTANTLY_API_KEY")),
             "LinkedIn": bool(self.env_vars.get("LINKEDIN_EMAIL")),
             "Cloudflare Crawl": bool(self.env_vars.get("CLOUDFLARE_ACCOUNT_ID")),

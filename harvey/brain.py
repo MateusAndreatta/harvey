@@ -1,10 +1,10 @@
 """Brain — Harvey's thinking engine.
 
 Runs on the operator's Claude subscription (Claude Code headless, the
-default) or, when ``brain.provider: codex`` is configured, their ChatGPT
-subscription through an isolated Codex runtime (see harvey/codex.py). The
-provider is fixed per Brain; a failing provider never falls back to the
-other one.
+default), their ChatGPT subscription (``brain.provider: codex``, see
+harvey/codex.py), or their Cursor subscription (``brain.provider: cursor``,
+see harvey/cursor_cli.py). The provider is fixed per Brain; a failing
+provider never falls back to another one.
 """
 
 import asyncio
@@ -39,17 +39,17 @@ _NON_RETRYABLE_PATTERNS = (
 )
 
 
-PROVIDER_LABELS = {"claude": "Claude", "codex": "Codex"}
+PROVIDER_LABELS = {"claude": "Claude", "codex": "Codex", "cursor": "Cursor"}
 
 # Settings key holding the brain's last health transition, for `harvey
 # status` and the dashboard: {"provider", "status": "ok"|"paused", "reason",
 # "since", and for pauses "kind" (plus "until", epoch seconds, for usage limits)}.
 BRAIN_STATUS_KEY = "brain_status"
 
-# Codex failures that repeat on every call until the operator acts (login,
-# CLI version, model choice, an unsafe Codex config layer). After one, the
-# Brain stops starting runtimes until something changes.
-_PERSISTENT_CODEX_KINDS = {"setup", "auth", "isolation"}
+# Failures that repeat on every call until the operator acts (login, CLI,
+# model choice, an isolation break). After one, the Brain stops starting
+# runtimes until something changes. Shared by Codex and Cursor.
+_PERSISTENT_PROVIDER_KINDS = {"setup", "auth", "isolation"}
 # Re-check a paused provider at least this often even if nothing changed
 # on disk (e.g. a managed config layer was fixed).
 PROVIDER_RECHECK_SECONDS = 1800
@@ -88,7 +88,8 @@ class Brain:
         self.provider = self.config.provider
         self.model = self.config.model
         self.codex = None
-        # Codex health (unused for Claude, whose behaviour is unchanged).
+        self.cursor = None
+        # Provider health (unused for Claude, whose behaviour is unchanged).
         self.unavailable = ""
         self._unavailable_at = 0.0
         self._unavailable_fingerprint = None
@@ -101,10 +102,22 @@ class Brain:
                 model=self.model, reasoning_effort=self.config.reasoning_effort
             )
             self.quota = CodexQuotaClient(self.codex)
+        elif self.provider == "cursor":
+            from harvey.cursor_cli import CursorCallBudget, CursorClient
+            self.cursor = CursorClient(model=self.model)
+            self.quota = CursorCallBudget()
         else:
             # Lazy import avoids a cycle (quota -> usage -> state).
             from harvey.integrations.quota import QuotaClient
             self.quota = QuotaClient()
+
+    def _adapter(self):
+        """The Codex or Cursor client, or None for Claude."""
+        if self.provider == "cursor":
+            return self.cursor
+        if self.provider == "codex":
+            return self.codex
+        return None
 
     @property
     def provider_label(self) -> str:
@@ -122,42 +135,47 @@ class Brain:
     async def preflight(self) -> str:
         """Can this Brain be used right now? Returns "" or the reason not.
 
-        Codex only (Claude keeps its existing behaviour): runs the adapter's
-        full pre-prompt check (CodexClient.preflight): CLI version, route and
-        lockdown attested with no login in the runtime, the native login read
-        only (expiry, renewal), then with the access-only copy the configured
-        model against the catalog, the ChatGPT account, and a started
-        tool-less thread. No turn, so no inference; nothing is written to the
-        native login. While paused, the check is repeated only when the login
-        file or the Codex executable changes, or every
+        Codex and Cursor (Claude keeps its existing behaviour). Codex runs
+        the adapter's full pre-prompt check. Cursor checks that the CLI
+        runs and that either a browser login or ``CURSOR_API_KEY`` works;
+        no prompt is sent. While paused, the check is repeated only when
+        the adapter's fingerprint changes, or every
         PROVIDER_RECHECK_SECONDS, so a persistent problem doesn't start
         runtimes every heartbeat.
         """
-        if self.provider != "codex":
+        adapter = self._adapter()
+        if adapter is None:
             return ""
         from harvey.codex import CodexError
+        from harvey.cursor_cli import CursorError
 
         await self._expire_usage_pause()
         if self.unavailable:
-            unchanged = self.codex.fingerprint() == self._unavailable_fingerprint
+            unchanged = adapter.fingerprint() == self._unavailable_fingerprint
             recent = time.monotonic() - self._unavailable_at < PROVIDER_RECHECK_SECONDS
             if unchanged and recent:
                 return self.unavailable
         try:
-            await self.codex.preflight()
-        except CodexError as e:
-            if e.kind in _PERSISTENT_CODEX_KINDS:
+            await adapter.preflight()
+        except (CodexError, CursorError) as e:
+            if e.kind in _PERSISTENT_PROVIDER_KINDS:
                 await self._mark_unavailable(e)
                 return self.unavailable
             return str(e)  # transient: skip this cycle, check again next time
         except Exception as e:
-            return f"Codex preflight failed unexpectedly ({type(e).__name__})."
+            return f"{self.provider_label} preflight failed unexpectedly ({type(e).__name__})."
         if self.unavailable:
             await self._mark_available()
         elif not self._status_synced:
-            logger.info(
-                f"Codex ready: supported CLI, isolation verified, login and account "
-                f"valid, model {self.model or 'auto'} usable with no tools (no prompt sent).")
+            if self.provider == "cursor":
+                logger.info(
+                    f"Cursor ready: CLI present, login checked, model "
+                    f"{self.cursor.effective_model()} (no prompt sent)."
+                )
+            else:
+                logger.info(
+                    f"Codex ready: supported CLI, isolation verified, login and account "
+                    f"valid, model {self.model or 'auto'} usable with no tools (no prompt sent).")
             # A pause recorded before a restart must not outlive the problem.
             self._status_synced = True
             try:
@@ -197,7 +215,8 @@ class Brain:
         first = not self.unavailable or self.unavailable != str(error)
         self.unavailable = str(error)
         self._unavailable_at = time.monotonic()
-        self._unavailable_fingerprint = self.codex.fingerprint()
+        adapter = self._adapter()
+        self._unavailable_fingerprint = adapter.fingerprint() if adapter else None
         if first:
             await self._record_status("paused", self.unavailable,
                                       kind=getattr(error, "kind", ""))
@@ -239,6 +258,11 @@ class Brain:
         """
         if self.provider == "codex":
             return await self._think_codex(
+                prompt, session_id=session_id, timeout=timeout,
+                max_retries=max_retries, agent=agent, task=task,
+            )
+        if self.provider == "cursor":
+            return await self._think_cursor(
                 prompt, session_id=session_id, timeout=timeout,
                 max_retries=max_retries, agent=agent, task=task,
             )
@@ -409,7 +433,7 @@ class Brain:
                     logger.warning(f"Codex call failed: {e}")
                     continue
                 logger.error(f"Codex call failed: {e}")
-                if e.kind in _PERSISTENT_CODEX_KINDS:
+                if e.kind in _PERSISTENT_PROVIDER_KINDS:
                     await self._mark_unavailable(e)
                 elif e.kind == "usage_limit":
                     await self._start_usage_pause()
@@ -440,6 +464,95 @@ class Brain:
             f"Last error: {last_error[:200]}"
         )
         return ""
+
+    async def _think_cursor(
+        self,
+        prompt: str,
+        session_id: str | None,
+        timeout: float,
+        max_retries: int,
+        agent: str,
+        task: str,
+    ) -> str:
+        """One isolated cursor-agent print per attempt (see harvey/cursor_cli.py).
+
+        Never falls back to Claude or Codex. A tool call, auth failure, or
+        usage limit ends the attempt; only retryable errors are tried again.
+        """
+        from harvey.cursor_cli import CursorError
+
+        paused = self.paused_reason
+        if paused:
+            logger.debug(f"Cursor call skipped: {paused}")
+            return ""
+        logger.debug(f"Brain call via Cursor (label={session_id})")
+        last_error = ""
+        for attempt in range(max_retries + 1):
+            if attempt > 0:
+                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                logger.info(
+                    f"Retrying Cursor call in {delay:.0f}s "
+                    f"(attempt {attempt + 1}/{max_retries + 1})..."
+                )
+                await asyncio.sleep(delay)
+            try:
+                result = await self.cursor.run(
+                    prompt, timeout=timeout, skip_if=lambda: self.paused_reason)
+            except CursorError as e:
+                if e.kind == "paused":
+                    logger.debug(f"Cursor call skipped: {e}")
+                    return ""
+                last_error = str(e)
+                if e.retryable:
+                    logger.warning(f"Cursor call failed: {e}")
+                    continue
+                logger.error(f"Cursor call failed: {e}")
+                if e.kind in _PERSISTENT_PROVIDER_KINDS:
+                    await self._mark_unavailable(e)
+                elif e.kind == "usage_limit":
+                    await self._start_usage_pause()
+                    invalidate = getattr(self.quota, "invalidate", None)
+                    if invalidate:
+                        invalidate()
+                return ""
+            except Exception as e:
+                logger.error(f"Cursor call failed unexpectedly ({type(e).__name__}).")
+                return ""
+
+            try:
+                await self.state.increment_usage(provider="cursor")
+            except Exception as e:
+                logger.warning(f"Failed to record usage counter: {e}")
+            try:
+                await self._record_cursor_usage(result, agent=agent, task=task,
+                                                label=session_id or "")
+            except Exception as e:
+                logger.warning(f"Failed to record usage event: {e}")
+            return result.text
+
+        logger.error(
+            f"Cursor call failed after {max_retries + 1} attempts. "
+            f"Last error: {last_error[:200]}"
+        )
+        return ""
+
+    async def _record_cursor_usage(self, result, agent: str, task: str, label: str):
+        """One usage row per Cursor call. Plans aren't billed per token."""
+        if not agent and label.startswith("harvey-"):
+            agent = label[len("harvey-"):].split("-")[0]
+        await self.state.record_usage_event(
+            agent=agent,
+            task=task or label,
+            session_id=result.session_id,
+            request_key=result.request_id,
+            model=result.model,
+            duration_ms=result.duration_ms,
+            num_turns=1,
+            source="cursor_agent",
+            provider="cursor",
+            cost_usd=0.0,
+            **result.usage,
+        )
 
     async def _record_codex_usage(self, result, agent: str, task: str, label: str):
         """One usage row per Codex call. ChatGPT plans aren't billed per
@@ -597,6 +710,9 @@ class Brain:
         against max_percent so Harvey always leaves the remainder for the
         user's own interactive work. Fallback when those are unavailable:
         Harvey's own call counter for this provider against max_daily_calls.
+
+        Cursor has no quota API. Call it with max_percent=None and
+        max_daily_calls set to usage.max_daily_cursor_calls.
         """
         await self._expire_usage_pause()
         if time.monotonic() < self._usage_limited_until:

@@ -1,10 +1,10 @@
 # Harvey
 
-**An autonomous sales agent that runs on your Claude Code or Codex subscription.**
+**An autonomous sales agent that runs on your Claude Code, Codex, or Cursor subscription.**
 
 Harvey finds businesses worth selling to, learns something specific about each one, writes cold email that references it, sends it, reads the replies, and works the conversation toward a meeting. It runs on your machine, in a loop, on its own.
 
-The unusual part: **there is no model API bill.** Harvey uses your Claude Pro or Max subscription through Claude Code, or your ChatGPT subscription through Codex. Model calls use the plan you already pay for, without an API key or per-token API billing. Claude is the default; [Codex is an opt-in provider on macOS and Linux](#using-a-chatgpt-plan-instead-codex).
+The unusual part: **there is no model API bill.** Harvey uses your Claude Pro or Max subscription through Claude Code, your ChatGPT subscription through Codex, or your Cursor subscription through the Cursor CLI. Model calls use the plan you already pay for. Claude is the default. [Codex](#using-a-chatgpt-plan-instead-codex) and [Cursor](#using-a-cursor-plan) are opt-in.
 
 ```
 $ harvey run
@@ -45,6 +45,7 @@ anything, and approving mail one message at a time:
 - [How the data is stored](#how-the-data-is-stored)
 - [Configuration](#configuration)
 - [Using a ChatGPT plan instead (Codex)](#using-a-chatgpt-plan-instead-codex)
+- [Using a Cursor plan](#using-a-cursor-plan)
 - [Legal and deliverability](#legal-and-deliverability)
 - [Troubleshooting](#troubleshooting)
 - [Project structure](#project-structure)
@@ -57,7 +58,7 @@ anything, and approving mail one message at a time:
 
 Every other autonomous sales agent bills you per token. That is the whole reason they cost what they cost: an agent that thinks in a loop, all day, is an agent that burns API credits in a loop, all day. Vendors solve this by thinking less — shorter prompts, cheaper models, fewer passes.
 
-Harvey uses the subscription-backed CLI for the provider you choose: `claude` for Claude Code, or an isolated `codex app-server` for Codex. Both return text with model tools disabled. Harvey handles the prospecting and mail operations itself.
+Harvey uses the subscription-backed CLI for the provider you choose: `claude` for Claude Code, an isolated `codex app-server` for Codex, or `cursor-agent` in ask mode for Cursor. Each path returns text with model tools kept off. Harvey handles the prospecting and mail operations itself.
 
 Your selected subscription covers model calls, subject to its usage limits. That lets Harvey use its skills library for personalization and reply handling without a separate model API bill.
 
@@ -65,7 +66,7 @@ Your selected subscription covers model calls, subject to its usage limits. That
 
 | | |
 |---|---|
-| Claude Pro/Max or a ChatGPT plan with Codex access | your existing subscription |
+| Claude Pro/Max, a ChatGPT plan with Codex, or a Cursor plan | your existing subscription |
 | Finding businesses | **$0** on the default source, or ~$0.37 per 1,000 on the cheapest paid one |
 | Reading their websites | **$0** — three HTTP requests each, no model call |
 | Writing and sending | your subscription + a mailbox (~$7/mo Google Workspace) |
@@ -73,7 +74,7 @@ Your selected subscription covers model calls, subject to its usage limits. That
 
 For comparison, the tools Harvey replaces start at $250–500/month — and they are weakest precisely where Harvey is strongest: small local businesses with 5–50 people, where single-provider contact coverage caps out around 30% and micro-businesses are frequently absent entirely.
 
-**Harvey also budgets itself.** It reads the active provider's subscription quota and throttles to leave headroom for your own Claude or Codex work. Set `max_daily_claude_percent: 80` for either provider—the setting's name predates Codex support. If quota cannot be read, Harvey reports it as unavailable and falls back to its daily call budget.
+**Harvey also budgets itself.** For Claude and Codex it reads the subscription quota and throttles to leave headroom for your own work. Set `max_daily_claude_percent: 80` for those providers — the setting's name predates Codex support. If that quota cannot be read, Harvey reports it as unavailable and falls back to its daily call count. Cursor has no quota API, so Harvey counts its own calls against `usage.max_daily_cursor_calls` (default 200).
 
 Harvey runs locally with your own login. Check the terms and usage limits of the provider you choose.
 
@@ -106,7 +107,7 @@ Profiling and outbox draining ride along on **every** cycle regardless, because 
 ### Prerequisites
 
 - **Python 3.11+** — check with `python3 --version`. macOS ships 3.9; if that's what you have, `brew install python@3.13` first.
-- An active **Claude Pro or Max** subscription, with the CLI logged in (`claude login`) — or, opt-in, a **ChatGPT plan with the Codex CLI** ([see below](#using-a-chatgpt-plan-instead-codex))
+- An active **Claude Pro or Max** subscription, with the CLI logged in (`claude login`) — or, opt-in, a **ChatGPT plan with the Codex CLI** ([see below](#using-a-chatgpt-plan-instead-codex)) — or, opt-in, a **Cursor plan** with `cursor-agent` ([see below](#using-a-cursor-plan))
 - A mailbox to send from — Gmail/Workspace recommended, on a *dedicated secondary domain*. Microsoft 365 works too ([setup](docs/microsoft365.md))
 
 ### Easiest: let Claude set it up
@@ -394,11 +395,11 @@ icp:          { industries, titles, company_size, geography, hiring_signals, geo
 channels:
   email:      { provider: gmail | microsoft | smtp | instantly, max_daily_sends, require_approval,
                 send_to_risky, max_bounce_rate }
-usage:        { max_daily_claude_percent, heartbeat_interval_minutes, quiet_hours }
-brain:        { provider: claude | codex, model, reasoning_effort }   # optional; claude by default
+usage:        { max_daily_claude_percent, max_daily_cursor_calls, heartbeat_interval_minutes, quiet_hours }
+brain:        { provider: claude | codex | cursor, model, reasoning_effort }   # optional; claude by default
 ```
 
-`max_daily_claude_percent` caps whichever subscription `brain.provider` uses (the name predates Codex support).
+`max_daily_claude_percent` caps the Claude or Codex subscription (the name predates Codex support). With `brain.provider: cursor`, the cap is `usage.max_daily_cursor_calls` (default 200).
 
 If `harvey.local.yaml` exists it wins. It's gitignored, so a fork can carry real product configuration while the tracked `harvey.yaml` stays a template — nobody publishes their positioning and pricing by accident.
 
@@ -410,7 +411,7 @@ harvey dashboard             # web UI at localhost:5555
 harvey signals               # review/confirm what to prospect against
 harvey discover              # find businesses; --providers / --estimate
 harvey profile               # read discovered companies' sites (free)
-harvey train <url>           # learn a product from its website (--provider codex --model gpt-5.5)
+harvey train <url>           # learn a product from its website (--provider cursor --model composer-2.5)
 harvey status                # pipeline summary
 harvey usage                 # active provider's quota + per-agent tokens
 harvey outbox                # review queued email
@@ -454,6 +455,38 @@ What to know:
 
 ---
 
+## Using a Cursor plan
+
+Claude is the default. A paid Cursor plan can be the brain instead, through the [Cursor CLI](https://cursor.com/docs/cli) (`cursor-agent`). Calls stay on that subscription. `composer-2.5` is included in the plan and is the model Harvey suggests when `brain.model` is blank.
+
+```bash
+curl https://cursor.com/install -fsS | bash
+cursor-agent login                 # or set CURSOR_API_KEY in .env
+```
+
+Then pick **cursor** in `harvey setup` (it suggests `composer-2.5`), run `harvey train <url> --provider cursor --model composer-2.5`, or add to your config:
+
+```yaml
+brain:
+  provider: cursor
+  model: composer-2.5      # included in the plan; blank uses this same id
+usage:
+  max_daily_cursor_calls: 200
+```
+
+What to know:
+
+- **It's the provider you configured.** Harvey uses exactly `brain.provider`. A Cursor failure stays a Cursor failure, with a log line of kind setup, auth, usage_limit, timeout, or isolation. A Cursor-only machine doesn't need Claude or Codex installed.
+- **Print mode can use tools, and the CLI has no tools-off flag.** Each prompt runs in an empty temporary workspace (never the Harvey checkout) with a deny-all permission file, `--mode ask`, and `--trust`. The command never includes `--force`, `--yolo`, `--approve-mcps`, or `--auto-review`. Stdout is `stream-json` so a tool request is visible while the process is still running. The first tool event kills the process group and the answer is discarded. A call that writes a file outside `.cursor/` inside that workspace, or rewrites the deny list, is discarded too. The file check only sees the temporary workspace; a write anywhere else is covered by that same stream kill. After every call, including a normal exit, Harvey kills the whole process group so `cursor-agent`'s `worker-server` does not stay behind with the API key in its environment.
+- **Your Cursor config stays yours for this call.** Harvey sets `CURSOR_CONFIG_DIR` to a private directory that carries the same deny list, so `~/.cursor/cli-config.json` is not the config the process runs under. `HOME` is left alone, so a browser login still works. Hooks in `~/.cursor/hooks.json` and enterprise hooks still load from their own files; the stream kill is what stops a tool those hooks start.
+- **Auth.** `cursor-agent login`, or `CURSOR_API_KEY` in the environment or `.env`. `cursor-agent status` reports unauthenticated when the only credential is that key, so Harvey checks a set key with `cursor-agent models` and reads status only when no key is set. The key stays in the environment and is never placed on the command line.
+- **Models.** Harvey always passes `--model`. A blank `brain.model` means `composer-2.5`. Any other id is passed through as you set it.
+- **Budget and usage.** The Cursor CLI has no quota API. Harvey counts its own calls against `usage.max_daily_cursor_calls` (default 200). A usage-limit error pauses Cursor calls for an hour. The dashboard Usage tab and `harvey usage` show today's calls against that cap. Token counts from the CLI (`inputTokens`, `outputTokens`, `cacheReadTokens`, `cacheWriteTokens`) are stored on each call. Cost stays 0 because the plan is not billed per token.
+- **When Cursor can't be used, Harvey pauses.** Before each heartbeat Harvey checks that `cursor-agent` runs and that a login or `CURSOR_API_KEY` works. No prompt is sent. A setup, auth, or isolation problem skips the cycle: nothing is drafted or sent, and the log, `harvey status`, and the dashboard say why. `harvey status --check` runs the same check. A usage-limit pause lasts an hour. Brief timeouts skip the call and retry. Cursor is allowed on Windows; Codex is still refused there.
+- **Install.** `curl https://cursor.com/install -fsS | bash`. Harvey does not pin a `cursor-agent` version. The safety boundary is the empty workspace, the deny list, and the stream kill.
+
+---
+
 ## Legal and deliverability
 
 Harvey automates outreach, but **you are the sender.** Cold email is legal in most places when done right and expensive when done wrong — CAN-SPAM penalties run to $53,088 per email. Harvey ships with compliant defaults. Keep them.
@@ -494,13 +527,15 @@ Harvey automates outreach, but **you are the sender.** Cold email is legal in mo
 
 **Codex calls fail** — Read the log line; every Codex error says what to do. "Not logged in" or "expired or is due for renewal" → use Codex once or run `codex login` with ChatGPT. "Hasn't been verified with Harvey" → install the supported Codex version named in the message. "Isolation could not be verified" → a Codex config layer outside your `~/.codex` (for example a managed or `/etc/codex` config) forces a tool, hook, MCP server, instructions or custom endpoint back on; Harvey refuses to send prompts until it's gone. Model catalog errors → choose an available model ID from the catalog shown in the message, or leave `brain.model` blank to select a listed model. Harvey never switches to Claude on its own.
 
+**Cursor calls fail** — Run `harvey status --check`. "Cursor CLI not found" → `curl https://cursor.com/install -fsS | bash`. Auth → `cursor-agent login`, or set `CURSOR_API_KEY` (`cursor-agent status` stays unauthenticated when only that key is set; Harvey checks the key with `cursor-agent models`). Isolation → a tool event or a file written outside `.cursor/` aborted the call and the answer was discarded. Usage limit → Cursor calls pause for an hour; if the message is the daily cap, raise `usage.max_daily_cursor_calls`. Harvey never switches to Claude or Codex on its own.
+
 **Discovery finds nothing** — Confirm signals first (`harvey signals --confirm free`); nothing is collected until you do. If you're on the free OpenStreetMap source, it only covers mapped trades and is thin for service-area businesses — `harvey discover --providers` shows the alternatives.
 
 **Overpass is throttling** — It's free volunteer infrastructure. Harvey walks three mirrors before giving up. Wait a few minutes, or use a paid provider for bulk work.
 
 **Emails land in spam** — Almost always the domain, not the copy. Check SPF/DKIM/DMARC, confirm warmup ran, halve your volume.
 
-**Harvey does nothing during the day** — Check `quiet_hours` and whether it hit `max_daily_claude_percent`. `harvey status` shows current state; the `actions` table logs every decision.
+**Harvey does nothing during the day** — Check `quiet_hours` and whether it hit `max_daily_claude_percent` (Claude or Codex) or `max_daily_cursor_calls` (Cursor). `harvey status` shows current state; the `actions` table logs every decision.
 
 **How do I stop it right now?** — `Ctrl+C`, or `harvey sending pause` to stop outbound while leaving the loop running. State is in SQLite, so it resumes cleanly.
 
@@ -513,8 +548,9 @@ Harvey automates outreach, but **you are the sender.** Cold email is legal in mo
 ```
 harvey/
 ├── main.py              # heartbeat loop
-├── brain.py             # Claude/Codex provider selection + skills + usage
+├── brain.py             # Claude/Codex/Cursor provider selection + skills + usage
 ├── codex.py             # Isolated Codex subscription runtime
+├── cursor_cli.py        # Isolated Cursor CLI runtime (ask mode, deny-all)
 ├── state.py             # SQLite schema, migrations, observations, cohorts
 ├── signals.py           # the 23-signal catalog Harvey proposes
 ├── pipeline.py          # DISCOVER → PROFILE chaining
@@ -529,7 +565,7 @@ harvey/
 
 skills/                  # ← the sales knowledge. Editable Markdown.
 prompts/                 # ← agent system prompts. Also editable Markdown.
-tests/                   # 242 tests
+tests/                   # 576 tests
 ```
 
 ---
@@ -540,7 +576,7 @@ tests/                   # 242 tests
 
 **You decide what a good prospect is.** Harvey proposes signals; you confirm them. A prospect list you can't explain is a prospect list you shouldn't send to.
 
-**If it can be gotten deterministically, don't use a model.** Rank position, tech detection, junk filtering, the priority decision, the pre-send gate — all plain code. Claude or Codex is reserved for the parts that need judgment. That's why this runs on a subscription at all.
+**If it can be gotten deterministically, don't use a model.** Rank position, tech detection, junk filtering, the priority decision, the pre-send gate — all plain code. Claude, Codex, or Cursor is reserved for the parts that need judgment. That's why this runs on a subscription at all.
 
 **A failure is an observation, not silence.** "No team page found" is a finding. "Overpass is throttling" is a finding. Silent failures look exactly like clean results, which is how a broken run gets mistaken for an empty market.
 

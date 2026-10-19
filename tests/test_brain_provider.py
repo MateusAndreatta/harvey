@@ -355,7 +355,13 @@ async def test_existing_usage_rows_become_claude(tmp_path):
             await db.executescript(script)
         await db.execute("PRAGMA user_version = 10")
         await db.execute("INSERT INTO usage_events (id, model, output_tokens) VALUES ('a', 'm', 5)")
-        await db.execute("INSERT INTO usage_log (id, date, claude_calls) VALUES ('u', date('now'), 7)")
+        # Same local day increment_usage and get_usage_today use. SQLite
+        # date('now') is UTC and misses this row after 21:00 in Brazil.
+        from datetime import date
+        await db.execute(
+            "INSERT INTO usage_log (id, date, claude_calls) VALUES ('u', ?, 7)",
+            (date.today().isoformat(),),
+        )
         await db.commit()
 
     sm = StateManager(db_path)
@@ -366,7 +372,8 @@ async def test_existing_usage_rows_become_claude(tmp_path):
     assert await sm.get_usage_today("codex") == 0
     summary = await sm.get_state_summary()
     assert summary["usage_today"] == 7
-    assert summary["usage_today_by_provider"] == {"claude": 7, "codex": 0}
+    assert summary["usage_today_by_provider"] == {"claude": 7, "codex": 0, "cursor": 0}
+    assert await sm.get_usage_today("cursor") == 0
     with pytest.raises(ValueError):
         await sm.record_usage_event(provider="gemini")
 
@@ -377,18 +384,28 @@ async def test_existing_usage_rows_become_claude(tmp_path):
 def test_trainer_uses_and_writes_back_the_selection(tmp_path, monkeypatch):
     import harvey.trainer as trainer_mod
 
+    # An operator's harvey.local.yaml lives at the repo root and wins over
+    # the selection this test is checking. Read and write only the temp dir.
+    monkeypatch.setattr(trainer_mod, "PROJECT_ROOT", tmp_path)
+    monkeypatch.chdir(tmp_path)
+    out = tmp_path / "harvey.local.yaml"
+
     monkeypatch.setattr(trainer_mod, "load_brain_config",
                         lambda: BrainConfig(provider="codex", model="gpt-5.5"))
     trainer = trainer_mod.Trainer()
     assert trainer.brain.provider == "codex" and trainer.brain.model == "gpt-5.5"
-    built = trainer._build_config({"product_name": "W"}, {}, {}, "acme.com")
+    built = trainer._build_config(
+        {"product_name": "W"}, {}, {}, "acme.com", output_path=out,
+    )
     assert built["brain"] == {"provider": "codex", "model": "gpt-5.5"}
     # The written config loads back with the same selection.
     assert HarveyConfig(**built).brain == BrainConfig(provider="codex", model="gpt-5.5")
 
     explicit = trainer_mod.Trainer(brain_config=BrainConfig())
     assert explicit.brain.provider == "claude"
-    assert explicit._build_config({}, {}, {}, "acme.com")["brain"] == {"provider": "claude"}
+    assert explicit._build_config(
+        {}, {}, {}, "acme.com", output_path=out,
+    )["brain"] == {"provider": "claude"}
 
 
 def test_cli_train_flags_select_the_provider(monkeypatch):
@@ -399,8 +416,9 @@ def test_cli_train_flags_select_the_provider(monkeypatch):
     seen = {}
 
     class FakeTrainer:
-        def __init__(self, brain_config=None):
+        def __init__(self, brain_config=None, brain_override=False):
             seen["config"] = brain_config
+            seen["override"] = brain_override
 
         async def train(self, url, max_pages=100):
             seen["url"] = url
@@ -414,10 +432,12 @@ def test_cli_train_flags_select_the_provider(monkeypatch):
     cli.cmd_train(args)
     # Switching provider never carries the other provider's model along.
     assert seen["config"] == BrainConfig(provider="codex", reasoning_effort="low")
+    assert seen["override"] is True
 
     args.provider, args.reasoning_effort = None, None
     cli.cmd_train(args)
     assert seen["config"] == BrainConfig(provider="claude", model="claude-opus-4-8")
+    assert seen["override"] is False
 
 
 def _answering(answers, prompts):
@@ -437,12 +457,15 @@ def _answering(answers, prompts):
     (["codex", ""], BrainConfig(provider="codex", model="gpt-5.5")),         # accept suggestion
     (["codex", "gpt-6-sol"], BrainConfig(provider="codex", model="gpt-6-sol")),  # explicit kept
     (["codex", "--model", "my-model"], BrainConfig(provider="codex", model="my-model")),
+    (["cursor", ""], BrainConfig(provider="cursor", model="composer-2.5")),
+    (["cursor", "grok-4.7"], BrainConfig(provider="cursor", model="grok-4.7")),
     (["claude", ""], BrainConfig()),
     (["claude", "opus"], BrainConfig(model="opus")),
 ])
 def test_setup_model_prompt(monkeypatch, answers, expected):
     import harvey.setup as setup_mod
     from harvey.codex import SUGGESTED_MODEL
+    from harvey.cursor_cli import SUGGESTED_MODEL as CURSOR_MODEL
 
     prompts = []
     monkeypatch.setattr(setup_mod, "_ask", _answering(answers, prompts))
@@ -452,6 +475,8 @@ def test_setup_model_prompt(monkeypatch, answers, expected):
         # Suggested, never forced: an explicit name is kept as typed (and
         # validated; a flag-like answer is asked again).
         assert all(p == ("Model", SUGGESTED_MODEL) for p in model_prompts)
+    elif expected.provider == "cursor":
+        assert all(p == ("Model", CURSOR_MODEL) for p in model_prompts)
     else:
         assert model_prompts == [("Model (leave blank for the default)", "")]
 

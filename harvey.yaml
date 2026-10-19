@@ -59,6 +59,7 @@ channels:
 
 usage:
   max_daily_claude_percent: 80
+  max_daily_cursor_calls: 200   # cursor provider: Harvey's own daily call cap
   heartbeat_interval_minutes: 15
   quiet_hours:
     start: "22:00"

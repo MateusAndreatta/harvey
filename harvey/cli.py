@@ -166,7 +166,7 @@ def cmd_train(args):
         print(f"  {e}")
         sys.exit(2)
 
-    trainer = Trainer(brain_config=brain_config)
+    trainer = Trainer(brain_config=brain_config, brain_override=bool(overrides))
     asyncio.run(trainer.train(url, max_pages=args.max_pages))
 
 
@@ -199,6 +199,7 @@ def cmd_status(args):
         by_provider = summary.get("usage_today_by_provider", {})
         print(f"  Claude calls today:   {by_provider.get('claude', summary['usage_today'])}")
         print(f"  Codex calls today:    {by_provider.get('codex', 0)}")
+        print(f"  Cursor calls today:   {by_provider.get('cursor', 0)}")
         from harvey.brain import BRAIN_STATUS_KEY, Brain, active_brain_status
         from harvey.config import ConfigError, load_brain_config
         try:
@@ -218,7 +219,10 @@ def cmd_status(args):
             else:
                 brain = Brain(state, brain_config)
                 problem = await brain.preflight()
-                label = brain.provider_label + (f" ({brain.model})" if brain.model else "")
+                model = brain.model
+                if brain.provider == "cursor" and brain.cursor is not None:
+                    model = brain.cursor.effective_model()
+                label = brain.provider_label + (f" ({model})" if model else "")
                 if problem:
                     healthy = False
                     print(f"  Brain:                {label} NOT READY")
@@ -226,11 +230,15 @@ def cmd_status(args):
                 elif brain.provider == "codex":
                     print(f"  Brain:                {label} ready (CLI, isolation, login, "
                           "model and account checked; no prompt sent)")
+                elif brain.provider == "cursor":
+                    print(f"  Brain:                {label} ready (CLI and login checked; "
+                          "no prompt sent)")
                 else:
                     print(f"  Brain:                {label} (not checked: Claude is checked "
                           "by its first call)")
         elif brain_status.get("status") == "paused":
-            label = {"claude": "Claude", "codex": "Codex"}.get(brain_status.get("provider"), "Brain")
+            from harvey.brain import PROVIDER_LABELS
+            label = PROVIDER_LABELS.get(brain_status.get("provider"), "Brain")
             print(f"  Brain:                {label} PAUSED since {brain_status.get('since', '?')}")
             print(f"                        {brain_status.get('reason', '')}")
         print()
@@ -261,6 +269,8 @@ def cmd_usage(args):
         # such; one is never shown as the other.
         windows = None
         provider = brain_config.provider if brain_config else None
+        cursor_used = None
+        cursor_cap = None
         try:
             if provider == "codex":
                 from harvey.codex import CodexClient, CodexQuotaClient
@@ -269,13 +279,23 @@ def cmd_usage(args):
             elif provider == "claude":
                 from harvey.integrations.quota import QuotaClient
                 windows = await QuotaClient().get_utilization()
+            elif provider == "cursor":
+                from harvey.config import cursor_call_cap
+                cursor_used = await state.get_usage_today("cursor")
+                cursor_cap = cursor_call_cap()
         except Exception:
             pass
 
-        label = {"claude": "Claude", "codex": "Codex"}.get(provider, "Brain")
+        label = {"claude": "Claude", "codex": "Codex", "cursor": "Cursor"}.get(provider, "Brain")
         print(f"\n  {label} Usage")
         print("  " + "=" * 52)
-        if windows:
+        if provider == "cursor":
+            used = cursor_used if cursor_used is not None else 0
+            cap = cursor_cap if cursor_cap is not None else 200
+            print(f"  Calls today:      {used} / {cap}")
+            print("  Cursor has no live quota API. Harvey stops at")
+            print("  usage.max_daily_cursor_calls of its own calls per day.")
+        elif windows:
             labels = {"five_hour": "5-hour window", "seven_day": "Weekly",
                       "limit_reached": "Usage limit"}
             for key, w in windows.items():
@@ -688,7 +708,7 @@ def main():
         help="Max pages to crawl (default: 100)",
     )
     sub.add_argument(
-        "--provider", choices=["claude", "codex"], default=None,
+        "--provider", choices=["claude", "codex", "cursor"], default=None,
         help="Subscription to think with (default: the one in your config, else claude)",
     )
     sub.add_argument("--model", default=None, help="Model for this provider (default: provider default)")
@@ -709,7 +729,7 @@ def main():
     sub.add_argument(
         "--check", action="store_true",
         help="Also check the configured brain now (Codex: CLI version, isolation "
-             "and login; no model call)",
+             "and login; Cursor: CLI and login; no model call)",
     )
     sub.set_defaults(func=cmd_status)
 
