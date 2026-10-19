@@ -486,12 +486,11 @@ async def _apply_migration(db, script: str):
         await db.executescript("\n".join(kept))
 
 
-# Merge with PR #1 (Cursor brain): change this tuple to
-# ("claude", "codex", "cursor") once harvey/brain.py can run that provider.
-# Adding it here first would make BrainConfig accept "cursor" and then
-# Brain.provider_label would KeyError. cursor_calls is already on the
-# usage summary below so that line does not have to be re-resolved.
-BRAIN_PROVIDERS = ("claude", "codex")
+# `cursor` is recorded here so a usage row does not crash before PR #1
+# (the Cursor brain) lands. config.BRAIN_PROVIDERS stays ("claude", "codex"):
+# BrainConfig still rejects provider "cursor" until brain.py can run it.
+# provider_label falls back to the raw name if a config slips through.
+BRAIN_PROVIDERS = ("claude", "codex", "cursor")
 _USAGE_LOG_COLUMN = {
     "claude": "claude_calls",
     "codex": "codex_calls",
@@ -1514,6 +1513,17 @@ class StateManager:
             ) as cursor:
                 row = await cursor.fetchone()
                 return row[0] if row else default
+
+    async def settings_with_prefix(self, prefix: str) -> dict[str, str]:
+        """Every settings row whose key starts with ``prefix``."""
+        if not prefix:
+            return {}
+        async with self._connect() as db:
+            async with db.execute(
+                "SELECT key, value FROM settings WHERE key LIKE ?",
+                (prefix + "%",),
+            ) as cursor:
+                return {row[0]: row[1] for row in await cursor.fetchall()}
 
     async def set_setting(self, key: str, value: str):
         async with self._connect() as db:

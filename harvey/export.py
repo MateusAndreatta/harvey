@@ -219,20 +219,42 @@ def _website(company) -> str:
     return f"https://{domain}" if domain else ""
 
 
-def _city(company) -> str:
-    from harvey.places import nearest_municipality
+def _stored_city(company) -> str:
+    city = (getattr(company, "city", "") or "").strip()
+    if city:
+        return city
+    location = (getattr(company, "location", "") or "").strip()
+    return location.split(",")[0].strip() if location else ""
+
+
+def _vague_city(city: str) -> bool:
     from harvey.textutil import fold
 
-    city = (getattr(company, "city", "") or "").strip()
-    if not city:
-        location = (getattr(company, "location", "") or "").strip()
-        city = location.split(",")[0].strip() if location else ""
     folded = fold(city)
-    vague = (not city) or ("metropolit" in folded) or folded in {"rmc", "rmsp"}
-    if vague and getattr(company, "latitude", None) is not None and getattr(company, "longitude", None) is not None:
-        hit = nearest_municipality(company.latitude, company.longitude)
-        if hit:
-            return hit[0]
+    return (not city) or ("metropolit" in folded) or folded in {"rmc", "rmsp"}
+
+
+def _city(company, cache: dict | None = None) -> str:
+    """Municipality for the CSV.
+
+    A cached reverse geocode wins: the stored city may be the neighbour
+    that a town-center guess assigned (Bosch in CIC stored as Araucária).
+    With no cache, a metro search label is left blank. The nearest town
+    center is not used — a wrong city is worse than an empty one.
+    """
+    from harvey.places import reverse_cache_key
+
+    lat = getattr(company, "latitude", None)
+    lon = getattr(company, "longitude", None)
+    if cache and lat is not None and lon is not None:
+        cached = cache.get(reverse_cache_key(float(lat), float(lon))) or ""
+        if cached and cached != "-":
+            name, _, _uf = cached.partition("|")
+            if name.strip():
+                return name.strip()
+    city = _stored_city(company)
+    if _vague_city(city):
+        return ""
     return city
 
 
@@ -259,9 +281,12 @@ async def collect_leads(
     a verified personal mailbox. Chain branches collapse to one row
     unless ``one_per_brand`` is false. Print and label shops are left out.
     """
-    from harvey.brands import drop_thin_lead, is_competitor_name
+    from harvey.brands import (
+        drop_thin_lead, is_competitor_name, is_segment_reseller, resellers_excluded,
+    )
     from harvey.scoring import pick_best_contact
 
+    drop_resellers = resellers_excluded(config)
     companies = [
         company for company in await state.list_companies()
         if not is_competitor_name(company.name)
@@ -270,7 +295,13 @@ async def collect_leads(
             company.name, company.phone, company.website,
             company.address, company.domain,
         )
+        and not (
+            drop_resellers and is_segment_reseller(
+                company.name, company.industry or "", company.kind or "",
+            )
+        )
     ]
+    cache = await state.settings_with_prefix("revgeo:")
     branch_counts: dict[str, int] = {}
     siblings: dict[str, list[str]] = {}
     if one_per_brand:
@@ -316,7 +347,7 @@ async def collect_leads(
         rows.append({
             "company_name": company.name,
             "segment": company.industry or "",
-            "city": _city(company),
+            "city": _city(company, cache),
             "address": company.address or "",
             "phone": phone,
             "website": _website(company),

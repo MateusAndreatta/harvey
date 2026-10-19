@@ -62,6 +62,9 @@ icp:
     "Curitiba e região metropolitana, PR": "-25.4284,-49.2733,40"
     "São Paulo, SP": "-23.5505,-46.6333,40"
   hiring_signals: []
+  # Mary Kay, "Aqui tem Natura", and an O Boticário counter are left out
+  # of cosmetics. A manufacturer stays. Set false to keep the counters.
+  exclude_resellers: true
 
 channels:
   email:

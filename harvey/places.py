@@ -1,10 +1,11 @@
-"""Distance and municipality names for a lead list.
+"""Distance helpers for a lead list.
 
 OpenStreetMap often has a lat/lon and no addr:city. The search label
-("Curitiba e região metropolitana") is not a city. A bundled centroid for
-each municipality in the Curitiba and São Paulo metros answers that offline.
-Anything farther than ``MAX_MUNICIPALITY_KM`` from every centroid is left
-for a cached reverse geocode.
+("Curitiba e região metropolitana") is not a city. The municipality comes
+from a cached reverse geocode (Nominatim zoom 10), which is a point inside
+the boundary. The bundled centroids are only a distance reference: south
+Curitiba (CIC) is closer to Araucária's town center than to Curitiba's, so
+nearest-centroid assigns the wrong city.
 """
 
 import math
@@ -108,7 +109,11 @@ def bounding_box(lat: float, lng: float, radius_m: int) -> tuple[float, float, f
 
 
 def nearest_municipality(lat: float, lon: float, max_km: float = MAX_MUNICIPALITY_KM):
-    """``(name, state)`` of the closest bundled town center, or None."""
+    """``(name, state)`` of the closest bundled town center, or None.
+
+    Not a city assignment. On a municipal border the nearest center is the
+    neighbour. Callers that need the municipality use a reverse geocode.
+    """
     best = None
     best_km = max_km
     for name, state, mlat, mlon in MUNICIPALITIES:
@@ -117,3 +122,49 @@ def nearest_municipality(lat: float, lon: float, max_km: float = MAX_MUNICIPALIT
             best_km = dist
             best = (name, state)
     return best
+
+
+def reverse_cache_key(lat: float, lon: float) -> str:
+    """Settings key for one reverse-geocoded point, about a metre."""
+    return f"revgeo:{lat:.5f},{lon:.5f}"
+
+
+# Full state name (accent-folded) → UF. Nominatim often returns "Paraná".
+_STATE_UF = {
+    "acre": "AC", "alagoas": "AL", "amapa": "AP", "amazonas": "AM",
+    "bahia": "BA", "ceara": "CE", "distrito federal": "DF",
+    "espirito santo": "ES", "goias": "GO", "maranhao": "MA",
+    "mato grosso": "MT", "mato grosso do sul": "MS", "minas gerais": "MG",
+    "para": "PA", "paraiba": "PB", "parana": "PR", "pernambuco": "PE",
+    "piaui": "PI", "rio de janeiro": "RJ", "rio grande do norte": "RN",
+    "rio grande do sul": "RS", "rondonia": "RO", "roraima": "RR",
+    "santa catarina": "SC", "sao paulo": "SP", "sergipe": "SE", "tocantins": "TO",
+}
+
+
+def municipality_from_address(address: dict | None) -> tuple[str, str]:
+    """``(city, UF)`` from a Nominatim address dict.
+
+    Municipality, city, town, and village are the city. Suburb, district,
+    neighbourhood, and industrial estate are not — CIC is inside Curitiba.
+    """
+    from harvey.textutil import fold
+
+    address = address or {}
+    city = (
+        address.get("municipality")
+        or address.get("city")
+        or address.get("town")
+        or address.get("village")
+        or ""
+    )
+    city = str(city).strip()
+    iso = str(
+        address.get("ISO3166-2-lvl4") or address.get("ISO3166-2-lvl6") or ""
+    ).strip().upper()
+    uf = ""
+    if iso.startswith("BR-") and len(iso) >= 5:
+        uf = iso.split("-", 1)[1][:2]
+    if not uf:
+        uf = _STATE_UF.get(fold(str(address.get("state") or "")), "")
+    return city, uf

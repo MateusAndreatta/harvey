@@ -65,26 +65,20 @@ _COMPETITOR = re.compile(
 )
 
 # Consultant listings, not the factory. Mary Kay in OSM is the consultant.
-# Natura the manufacturer does not match unless the name says consultor.
+# "Aqui tem Natura" is a reseller counter. Natura the manufacturer does not
+# match unless the name says consultor or the cosmetics-brand rule below.
 _RESELLER = re.compile(
-    r"consultor|consultora|revendedora|revendedor|mary kay|marykay"
+    r"consultor|consultora|revendedora|revendedor|mary kay|marykay|aqui tem"
+)
+
+# Franchise counters in a cosmetics search. A plant whose name says
+# indústria stays. Used only when the segment itself is cosmetics.
+_COSMETICS_SEGMENT = re.compile(r"cosmet|perfum|beleza|maquiag|higien")
+_COSMETICS_COUNTER = re.compile(
+    r"boticario|natura|mary kay|marykay|avon|eudora|hinode|franquia"
 )
 
 _MANUFACTURER = re.compile(r"industri|fabrica|manufatur|laboratorio")
-
-_GENERIC_NAMES = frozenset({
-    "atelie de costura",
-    "atelie",
-    "costura",
-    "confeccao",
-    "loja",
-    "comercio",
-    "empresa",
-    "salao",
-    "studio",
-    "estudio",
-    "oficina",
-})
 
 
 def _name_core(name: str) -> str:
@@ -124,9 +118,9 @@ def brand_key(name: str, brand: str = "", wikidata: str = "") -> str:
     wiki = (wikidata or "").strip()
     if wiki:
         return "wd:" + wiki
-    named = fold(brand)
-    if named:
-        return "brand:" + named
+    # An unknown brand tag (Votorantim on a cement plant) is not a retail
+    # chain. Collapsing every plant that shares a corporate brand, and then
+    # scoring it as a chain of shops, drops the factories the list is for.
     return ""
 
 
@@ -150,6 +144,30 @@ def is_manufacturer_name(name: str) -> bool:
     return bool(_MANUFACTURER.search(fold(name)))
 
 
+def is_segment_reseller(name: str, industry: str = "", kind: str = "") -> bool:
+    """Consultant or cosmetics franchise counter, not the plant.
+
+    Mary Kay and "Aqui tem Natura" match on the name alone. O Boticário,
+    Natura, and Avon match only inside a cosmetics segment, and a producer
+    (kind or a name that says indústria) is kept.
+    """
+    if (kind or "").strip().lower() == "producer" or is_manufacturer_name(name):
+        return False
+    if is_reseller_name(name):
+        return True
+    if not _COSMETICS_SEGMENT.search(fold(industry)):
+        return False
+    return bool(_COSMETICS_COUNTER.search(fold(name)))
+
+
+def resellers_excluded(config) -> bool:
+    """Drop reseller rows unless the ICP sets ``exclude_resellers: false``."""
+    icp = getattr(config, "icp", None)
+    if icp is None:
+        return True
+    return getattr(icp, "exclude_resellers", True) is not False
+
+
 def is_short_name(name: str) -> bool:
     """A name like 'ggg': three of the same letter, nothing else.
 
@@ -164,9 +182,18 @@ def is_short_name(name: str) -> bool:
     return len(set(compact)) == 1
 
 
+_GENERIC_NAME = re.compile(
+    r"^(sos )?(atelie( de costura)?|costura|confeccao|loja|comercio|"
+    r"empresa|salao|studio|estudio|oficina)$"
+)
+
+
 def is_generic_name(name: str) -> bool:
-    """A label like 'Ateliê de costura' with no company in it."""
-    return fold(name) in _GENERIC_NAMES
+    """A label like 'Ateliê de costura' or 'SOS costura' with no company in it.
+
+    Anchored, so 'costura da silva' stays.
+    """
+    return bool(_GENERIC_NAME.match(fold(name)))
 
 
 def drop_thin_lead(name: str, phone: str = "", website: str = "",

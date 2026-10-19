@@ -510,7 +510,11 @@ async def test_overpass_throttling_is_an_error_not_an_empty_market(monkeypatch):
         async with _client(handler) as client:
             await provider.fetch(client, {}, D.DiscoveryQuery(
                 term="roofer", coordinate="39.7,-104.9,40"))
-    assert seen == list(D.OpenStreetMap.ENDPOINTS), "every mirror should be tried"
+    assert seen == [
+        endpoint
+        for endpoint in D.OpenStreetMap.ENDPOINTS
+        for _ in range(D.OpenStreetMap.ATTEMPTS)
+    ], "each mirror is retried before the next"
 
 
 @pytest.mark.asyncio
@@ -536,6 +540,35 @@ async def test_overpass_falls_over_to_the_next_mirror(monkeypatch):
     assert out[0].name == "Sandpiper Exteriors"
     assert out[0].external_id == "osm:node/42"
     assert out[0].has_website is False
+
+
+@pytest.mark.asyncio
+async def test_overpass_retries_the_same_mirror_before_the_next(monkeypatch):
+    monkeypatch.setattr(D.OpenStreetMap, "BACKOFF", 0.0)
+    monkeypatch.setattr(D.OpenStreetMap, "RETRY_BACKOFF", 0.0)
+    seen = []
+
+    def handler(request):
+        seen.append(str(request.url))
+        if len(seen) == 1:
+            return httpx.Response(502, text="")
+        return httpx.Response(200, json={"elements": [{
+            "type": "way", "id": 7,
+            "center": {"lat": 39.7, "lon": -104.9},
+            "tags": {
+                "name": "Peak Roofing", "craft": "roofer",
+                "opening_hours": "Mo-Fr 08:00-17:00",
+                "building": "industrial", "landuse": "industrial",
+            },
+        }]})
+
+    provider = D.OpenStreetMap()
+    async with _client(handler) as client:
+        out = await provider.fetch(client, {}, D.DiscoveryQuery(
+            term="roofer", coordinate="39.7,-104.9,40"))
+    assert [url for url in seen] == [D.OpenStreetMap.ENDPOINTS[0]] * 2
+    assert len(out) == 1
+    assert out[0].traits == "hours industrial building footprint"
 
 
 @pytest.mark.asyncio

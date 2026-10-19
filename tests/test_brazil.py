@@ -96,9 +96,10 @@ def test_osm_maps_brazilian_trades_without_catching_unrelated_terms():
     cosmetics = osm._tags("Cosméticos")
     assert "shop=cosmetics" in cosmetics
     assert "shop=perfumery" in cosmetics
-    assert "industrial=factory|name~cosmet" in cosmetics
-    assert "office=company|name~cosmet" in cosmetics
-    assert "man_made=works|name~cosmet" in cosmetics
+    maker = "name~cosmet|perfum|higien|sabon|shampoo|beleza|maquiag"
+    assert f"industrial=factory|{maker}" in cosmetics
+    assert f"office=company|{maker}" in cosmetics
+    assert f"man_made=works|{maker}" in cosmetics
     assert osm._tags("Confecções") == ["craft=tailor", "craft=dressmaker"]
     assert osm._tags("Farmácias de manipulação") == [
         "amenity=pharmacy|name~manipula",
@@ -125,6 +126,9 @@ def test_osm_maps_brazilian_trades_without_catching_unrelated_terms():
     assert osm._kind({"industrial": "factory"}, "Cosméticos ABC") == "producer"
     assert osm._kind({"office": "company"}, "Indústria de Cosméticos") == "producer"
     assert osm._kind({"shop": "cosmetics"}, "Consultora Mary Kay") == "reseller"
+    assert osm._kind({"shop": "cosmetics"}, "Aqui tem Natura") == "reseller"
+    assert osm._kind({"shop": "cosmetics"}, "O Boticário") == "reseller"
+    assert osm._kind({"industrial": "factory"}, "Indústria Natura") == "producer"
     assert osm._kind({"craft": "printer"}, "Oficina") == "competitor"
     assert osm._kind({"shop": "copyshop"}, "Cópias") == "competitor"
 
@@ -145,7 +149,11 @@ def test_osm_maps_brazilian_trades_without_catching_unrelated_terms():
     assert osm._overpass_failure(_Response(504)) == "HTTP 504"
     assert osm._overpass_failure(_Response(500)) == "HTTP 500"
     assert osm._overpass_failure(_Response(200, {"elements": [{"id": 1}]})) == ""
-    assert osm.place_label("", "", -25.53, -49.21).startswith("São José dos Pinhais")
+    # No addr:city stays blank. Nearest-centroid would say São José dos
+    # Pinhais for -25.53,-49.21 and Araucária for Bosch in CIC.
+    assert osm.place_label("", "", -25.53, -49.21) == ""
+    assert osm.place_label("", "", -25.535, -49.323) == ""
+    assert osm.place_label("", "", -25.530, -49.316) == ""
     assert osm.place_label("Colombo", "PR", -25.29, -49.22) == "Colombo, PR"
     # First match still wins: dentist is mapped ahead of cosmetics.
     assert osm._tags("cosmetic dentist") == ["amenity=dentist"]
@@ -354,6 +362,35 @@ def test_score_company_reason_follows_language():
     assert "Revenda" in consult_reason
     assert maker_score >= consult_score + 20
 
+    plain = Company(
+        name="Cervejaria Sem Contato", industry="Cervejarias", city="Curitiba",
+        kind="producer",
+    )
+    named = Company(
+        name="Indústria de Bebidas Ltda", industry="Cervejarias", city="Curitiba",
+        kind="producer",
+        signals=[{"type": "osm_traits", "detail": "hours industrial building footprint"}],
+    )
+    plain_score, _ = score_company(plain, HarveyConfig(**_payload()))
+    named_score, named_reason = score_company(named, HarveyConfig(**_payload()))
+    assert named_score == plain_score + 6 + 4 + 3 + 5 + 4 + 5
+    assert named_score != plain_score
+    assert "planta" in named_reason
+
+    plant = Company(
+        name="Cimento Rio Branco", industry="Indústria", city="Curitiba",
+        kind="producer", brand="brand:votorantim", phone="(41) 3333-0105",
+    )
+    _, plant_reason = score_company(plant, HarveyConfig(**_payload(icp={
+        "industries": ["Indústria"],
+        "company_size": "médio",
+        "titles": ["Comprador"],
+        "geography": ["Curitiba, PR"],
+        "geo_coordinates": {"Curitiba, PR": "-25.4284,-49.2733,40"},
+    })))
+    assert "Rede" not in plant_reason
+    assert "Produtor" in plant_reason
+
 
 def test_example_yaml_is_a_lead_list_for_curitiba():
     cfg = load_config(str(EXAMPLE))
@@ -367,6 +404,7 @@ def test_example_yaml_is_a_lead_list_for_curitiba():
     ]
     assert match and match[0].coordinate.startswith("-25.4284")
     assert len(queries) == 20
+    assert cfg.icp.exclude_resellers is True
 
 
 def test_signal_codes_stay_put_when_labels_switch():
@@ -543,11 +581,20 @@ def test_print_shops_are_competitors_and_chains_have_a_brand_key():
     assert brand_key("Cervejaria do Porto") == ""
     assert brand_key("Filial Norte", brand="Nissei") == "chain:nissei"
     assert brand_key("Loja 3", wikidata="Q123") == "wd:Q123"
-    from harvey.brands import drop_thin_lead
+    assert brand_key("Cimento Rio Branco", brand="Votorantim") == ""
+    from harvey.brands import drop_thin_lead, is_segment_reseller
     assert drop_thin_lead("ggg")
     assert is_junk("", "Cervejaria do Porto") is False
     assert drop_thin_lead("Ateliê de costura")
     assert drop_thin_lead("Ateliê de costura", phone="(41) 3333-0000") is False
+    assert drop_thin_lead("SOS costura")
+    assert drop_thin_lead("SOS costura", phone="(41) 3333-0000") is False
+    assert drop_thin_lead("costura da silva") is False
+    assert is_segment_reseller("Aqui tem Natura", "Cosméticos")
+    assert is_segment_reseller("O Boticário", "Cosméticos")
+    assert is_segment_reseller("Consultora Mary Kay")
+    assert is_segment_reseller("Indústria Natura", "Cosméticos") is False
+    assert is_segment_reseller("O Boticário", "Farmácias") is False
 
 
 @pytest.mark.asyncio
@@ -644,14 +691,148 @@ async def test_nearby_same_name_merges_and_keeps_the_domain(state):
 
 
 @pytest.mark.asyncio
-async def test_export_replaces_the_metro_label_with_the_municipality(state):
+async def test_export_uses_a_cached_municipality_not_the_nearest_town(state):
+    from harvey.places import nearest_municipality
+
+    # The centroid answer is the neighbour. Export must not repeat it.
+    assert nearest_municipality(-25.535, -49.323)[0] == "Araucária"
+    assert nearest_municipality(-25.530, -49.316)[0] == "São José dos Pinhais"
+
     await state.add_company(Company(
-        name="Cervejaria do Porto", industry="Cervejarias",
+        name="Trox", industry="Indústria",
         city="Curitiba e região metropolitana",
-        latitude=-25.53, longitude=-49.21, external_id="osm:node/30",
+        latitude=-25.530, longitude=-49.316, external_id="osm:node/30",
+    ))
+    await state.add_company(Company(
+        name="Bosch", industry="Indústria", city="Araucária",
+        latitude=-25.535, longitude=-49.323, external_id="osm:node/31",
     ))
     rows = await collect_leads(state, config=HarveyConfig(**_payload()))
-    assert rows[0]["city"] == "São José dos Pinhais"
+    by_name = {row["company_name"]: row for row in rows}
+    assert by_name["Trox"]["city"] == ""
+    assert by_name["Bosch"]["city"] == "Araucária"
+
+    await state.set_setting("revgeo:-25.53500,-49.32300", "Curitiba|PR")
+    await state.set_setting("revgeo:-25.53000,-49.31600", "Curitiba|PR")
+    rows = await collect_leads(state, config=HarveyConfig(**_payload()))
+    by_name = {row["company_name"]: row for row in rows}
+    assert by_name["Bosch"]["city"] == "Curitiba"
+    assert by_name["Trox"]["city"] == "Curitiba"
+
+
+@pytest.mark.asyncio
+async def test_reverse_geocode_names_curitiba_and_replaces_the_neighbour(state, monkeypatch):
+    import httpx
+
+    from harvey.collectors import discover as D
+    from harvey.places import municipality_from_address
+
+    monkeypatch.setattr(D, "NOMINATIM_INTERVAL", 0)
+    assert municipality_from_address({
+        "suburb": "CIC",
+        "city_district": "Cidade Industrial",
+        "industrial": "Cidade Industrial de Curitiba",
+        "state": "Paraná",
+        "ISO3166-2-lvl4": "BR-PR",
+    }) == ("", "PR")
+    assert municipality_from_address({
+        "suburb": "CIC",
+        "city": "Curitiba",
+        "municipality": "Curitiba",
+        "state": "Paraná",
+        "ISO3166-2-lvl4": "BR-PR",
+    }) == ("Curitiba", "PR")
+
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        assert request.url.params["zoom"] == "10"
+        assert "pt-BR" in request.headers["accept-language"]
+        return httpx.Response(200, json={"address": {
+            "suburb": "CIC",
+            "city": "Curitiba",
+            "municipality": "Curitiba",
+            "state": "Paraná",
+            "ISO3166-2-lvl4": "BR-PR",
+        }})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        label = await D._reverse_municipality(state, -25.535, -49.323, client=client)
+        again = await D._reverse_municipality(state, -25.535, -49.323, client=client)
+    assert label == "Curitiba, PR"
+    assert again == label
+    assert calls["n"] == 1
+
+    cid, was_new = await _upsert(
+        state,
+        Business(
+            name="Bosch", external_id="osm:node/50", provider="osm",
+            latitude=-25.535, longitude=-49.323,
+        ),
+        DiscoveryQuery(term="Indústria", location="Curitiba e região metropolitana, PR"),
+    )
+    assert was_new
+    assert (await state.get_company(cid)).city == "Curitiba"
+
+    await state.update_company_lead(cid, city="Araucária")
+    cid2, again_new = await _upsert(
+        state,
+        Business(
+            name="Bosch", external_id="osm:node/50", provider="osm",
+            location="Curitiba, PR",
+            latitude=-25.535, longitude=-49.323,
+        ),
+        DiscoveryQuery(term="Indústria", location="Curitiba, PR"),
+    )
+    assert not again_new and cid2 == cid
+    assert (await state.get_company(cid)).city == "Curitiba"
+
+
+@pytest.mark.asyncio
+async def test_cosmetics_resellers_drop_unless_the_icp_keeps_them(state):
+    icp = {
+        "industries": ["Cosméticos"],
+        "company_size": "pequeno",
+        "titles": ["Proprietário"],
+        "geography": ["Curitiba, PR"],
+        "geo_coordinates": {"Curitiba, PR": "-25.4284,-49.2733,40"},
+    }
+    for name, kind, ext in (
+        ("Aqui tem Natura", "reseller", "osm:node/40"),
+        ("Consultora Mary Kay", "reseller", "osm:node/41"),
+        ("O Boticário", "retail", "osm:node/42"),
+        ("Indústria Natura", "producer", "osm:node/43"),
+        ("SOS costura", "", "osm:node/44"),
+    ):
+        await state.add_company(Company(
+            name=name, industry="Cosméticos", city="Curitiba",
+            kind=kind, external_id=ext,
+        ))
+    cfg = HarveyConfig(**_payload(icp=icp))
+    assert cfg.icp.exclude_resellers is True
+    names = {row["company_name"] for row in await collect_leads(state, config=cfg)}
+    assert names == {"Indústria Natura"}
+
+    kept = HarveyConfig(**_payload(icp={**icp, "exclude_resellers": False}))
+    names = {row["company_name"] for row in await collect_leads(state, config=kept)}
+    assert {"Aqui tem Natura", "O Boticário", "Consultora Mary Kay", "Indústria Natura"} <= names
+    assert "SOS costura" not in names
+
+
+@pytest.mark.asyncio
+async def test_cursor_usage_records_before_the_brain_can_run_it(state):
+    from harvey.config import BRAIN_PROVIDERS as config_providers
+    from harvey.config import BrainConfig
+    from harvey.state import BRAIN_PROVIDERS as state_providers
+
+    assert state_providers == ("claude", "codex", "cursor")
+    assert "cursor" not in config_providers
+    with pytest.raises(ValueError, match="cursor"):
+        BrainConfig(provider="cursor")
+    assert await state.record_usage_event(provider="cursor", output_tokens=3) is True
+    with pytest.raises(ValueError):
+        await state.record_usage_event(provider="gemini")
 
 
 @pytest.mark.asyncio

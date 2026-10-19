@@ -9,7 +9,9 @@ The points are spread on purpose. A search already filtered by trade, so
 "segment matches" cannot be most of the score or every row lands on 90.
 """
 
-from harvey.brands import brand_key, is_reseller_name
+import re
+
+from harvey.brands import brand_key, is_manufacturer_name, is_reseller_name
 from harvey.places import haversine_km
 from harvey.textutil import fold
 
@@ -172,9 +174,31 @@ def in_target_region(company, config) -> bool:
 
 
 def _is_chain(company) -> bool:
-    if (getattr(company, "brand", "") or "").strip():
+    """A retail chain, not a manufacturer that carries a corporate brand.
+
+    ``brand:votorantim`` on Cimento Rio Branco is a plant. The penalty is
+    for Droga Raia and O Boticário, whose key starts with ``chain:`` or
+    whose name is one of those retail brands.
+    """
+    kind = (getattr(company, "kind", "") or "").strip().lower()
+    name = getattr(company, "name", "") or ""
+    if kind == "producer" or is_manufacturer_name(name):
+        return False
+    brand = (getattr(company, "brand", "") or "").strip()
+    if brand.startswith("chain:"):
         return True
-    return bool(brand_key(getattr(company, "name", "") or ""))
+    return brand_key(name).startswith("chain:")
+
+
+def _trait_tokens(company) -> set[str]:
+    tokens: set[str] = set()
+    for sig in getattr(company, "signals", None) or []:
+        if isinstance(sig, dict) and sig.get("type") == "osm_traits":
+            tokens.update(str(sig.get("detail") or "").split())
+    return tokens
+
+
+_LEGAL_ENTITY = re.compile(r"\b(ltda|eireli|s\.a\.|s/a)\b")
 
 
 def score_company(company, config) -> tuple[int, str]:
@@ -209,8 +233,12 @@ def score_company(company, config) -> tuple[int, str]:
     address = bool((getattr(company, "address", "") or "").strip())
     public_email = bool((getattr(company, "public_email", "") or "").strip())
     name = getattr(company, "name", "") or ""
+    folded_name = fold(name)
     producer = kind == "producer"
     reseller = kind == "reseller" or is_reseller_name(name)
+    traits = _trait_tokens(company)
+    plant_name = bool(re.search(r"industri|fabrica", folded_name))
+    legal_entity = bool(_LEGAL_ENTITY.search(folded_name))
     # OSM tags a compounding pharmacy as a shop. The operator already named
     # that segment, so the tag is not a demotion to generic retail.
     retail = (kind == "retail" or (chain and not producer)) and not industry_hit
@@ -246,7 +274,26 @@ def score_company(company, config) -> tuple[int, str]:
         score += 7
     if public_email:
         score += 5
+    # The 51 pile is producer + industry + geography and nothing else.
+    # A name that says indústria or Ltda, and OSM traits stored at
+    # discovery, split that pile. Traits need a rediscover; the name
+    # does not.
+    if plant_name:
+        score += 6
+    if legal_entity:
+        score += 4
+    if "hours" in traits:
+        score += 3
+    if "industrial" in traits:
+        score += 5
+    if "building" in traits:
+        score += 4
+    if "footprint" in traits:
+        score += 5
     score = max(1, min(100, score))
+    plant_signal = plant_name or legal_entity or bool(
+        traits & {"hours", "industrial", "building", "footprint"}
+    )
 
     if portuguese:
         parts = []
@@ -276,6 +323,8 @@ def score_company(company, config) -> tuple[int, str]:
             parts.append("Tem endereço.")
         if public_email:
             parts.append("Tem e-mail publicado.")
+        if plant_signal:
+            parts.append("Nome ou mapa indica planta.")
         if not parts:
             parts.append("Sem dados de segmento para comparar com o ICP.")
     else:
@@ -306,6 +355,8 @@ def score_company(company, config) -> tuple[int, str]:
             parts.append("Has a street address.")
         if public_email:
             parts.append("Has a published email.")
+        if plant_signal:
+            parts.append("Name or map marks a plant.")
         if not parts:
             parts.append("No segment to compare with the ICP.")
 

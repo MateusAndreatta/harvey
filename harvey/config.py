@@ -67,6 +67,9 @@ class ICPConfig(BaseModel):
     #   "Denver, CO": "39.7392,-104.9903,50"
     # Without one, listings providers can only match on the business name.
     geo_coordinates: dict[str, str] = {}
+    # Leave consultant and franchise counters (Mary Kay, "Aqui tem Natura",
+    # O Boticário) out of a cosmetics list. A manufacturer stays.
+    exclude_resellers: bool = True
 
 
 class EmailChannelConfig(BaseModel):
