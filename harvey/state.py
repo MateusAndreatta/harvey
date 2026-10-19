@@ -414,6 +414,8 @@ MIGRATIONS: list[str] = [
     ALTER TABLE usage_log ADD COLUMN codex_calls INTEGER DEFAULT 0;
     """,
     # ── v12: Cursor subscription calls count separately too ──
+    # The lead-list change (PR #2) also adds a migration v12. This one stays
+    # v12; that change renumbers to v13 when the two land together.
     """
     -- claude_calls and codex_calls keep their own subscriptions. Cursor has
     -- no quota API, so this counter is also the budget.

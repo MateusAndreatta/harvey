@@ -74,6 +74,59 @@ def _brain(state, model="composer-2.5"):
     return Brain(state, BrainConfig(provider="cursor", model=model))
 
 
+def test_train_preserves_cursor_brain_and_call_cap(tmp_path, monkeypatch):
+    import harvey.trainer as trainer_mod
+
+    monkeypatch.setattr(trainer_mod, "PROJECT_ROOT", tmp_path)
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "harvey.yaml").write_text(
+        "usage:\n"
+        "  max_daily_claude_percent: 80\n"
+        "  max_daily_cursor_calls: 200\n"
+        "brain:\n"
+        "  provider: cursor\n"
+        "  model: composer-2.5\n"
+    )
+    local = tmp_path / "harvey.local.yaml"
+    # An earlier train left a local file that shadows harvey.yaml and
+    # omitted the Cursor provider and the call cap.
+    local.write_text("persona:\n  name: Old\n")
+    trainer = trainer_mod.Trainer(brain_config=BrainConfig())
+    built = trainer._build_config(
+        {"product_name": "W"}, {}, {}, "acme.example", output_path=local,
+    )
+    assert built["brain"] == {"provider": "cursor", "model": "composer-2.5"}
+    assert built["usage"]["max_daily_cursor_calls"] == 200
+
+    local.write_text(
+        "usage:\n"
+        "  max_daily_claude_percent: 40\n"
+        "  max_daily_cursor_calls: 17\n"
+        "  quiet_hours:\n"
+        "    timezone: America/Chicago\n"
+        "brain:\n"
+        "  provider: cursor\n"
+        "  model: composer-2.5\n"
+    )
+    built = trainer._build_config(
+        {"product_name": "W"}, {}, {}, "acme.example", output_path=local,
+    )
+    assert built["brain"]["model"] == "composer-2.5"
+    assert built["usage"]["max_daily_cursor_calls"] == 17
+    assert built["usage"]["max_daily_claude_percent"] == 40
+    assert built["usage"]["quiet_hours"]["timezone"] == "America/Chicago"
+    assert built["usage"]["quiet_hours"]["start"] == "22:00"
+
+    override = trainer_mod.Trainer(
+        brain_config=BrainConfig(provider="claude"), brain_override=True,
+    )
+    replaced = override._build_config(
+        {"product_name": "W"}, {}, {}, "acme.example", output_path=local,
+    )
+    assert replaced["brain"] == {"provider": "claude"}
+    assert replaced["usage"]["max_daily_cursor_calls"] == 17
+
+
 def test_cursor_config_accepts_the_provider():
     cfg = BrainConfig(provider=" Cursor ", model="composer-2.5")
     assert cfg.provider == "cursor" and cfg.model == "composer-2.5"
@@ -191,6 +244,58 @@ async def test_think_json_and_blank_model_uses_composer(state, cursor_log, monke
     assert await brain.think_json("classify") == {"intent": "interested"}
     prompt = [row for row in _calls(cursor_log) if row["cmd"] == "prompt"][-1]
     assert prompt["model"] == "composer-2.5"
+
+
+def _living_group_members(pgid: int) -> list[int]:
+    """Non-zombie members of a process group. Linux /proc."""
+    living = []
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return living
+    for entry in proc.iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text()
+        except OSError:
+            continue
+        tail = stat.rsplit(")", 1)[-1].split()
+        if len(tail) < 4:
+            continue
+        state, group = tail[0], int(tail[2])
+        if group == pgid and state != "Z":
+            living.append(int(entry.name))
+    return living
+
+
+@pytest.mark.asyncio
+async def test_finished_calls_leave_no_process_group(state, cursor_log, monkeypatch, tmp_path):
+    """A normal exit must reap the worker the leader leaves in its group."""
+    orphan_dir = tmp_path / "orphans"
+    orphan_dir.mkdir()
+    monkeypatch.setenv("HARVEY_FAKE_CURSOR_ORPHAN_DIR", str(orphan_dir))
+    monkeypatch.setenv("CURSOR_API_KEY", "cursor-test-key")
+    brain = _brain(state)
+    assert await brain.preflight() == ""
+    assert await brain.think("say oi", max_retries=0) == "oi"
+    records = list(orphan_dir.glob("*.txt"))
+    # preflight: --version and models (a key is set); think: the prompt.
+    assert len(records) >= 3
+    deadline = time.monotonic() + 2
+    lingering = []
+    groups = []
+    for record in records:
+        pid_s, pgid_s = record.read_text().split()
+        groups.append(int(pgid_s))
+        lingering.append(int(pid_s))
+    while time.monotonic() < deadline:
+        if not any(_living_group_members(pgid) for pgid in groups):
+            lingering = []
+            break
+        time.sleep(0.05)
+    else:
+        lingering = [pid for pgid in groups for pid in _living_group_members(pgid)]
+    assert lingering == []
 
 
 @pytest.mark.asyncio

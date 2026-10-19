@@ -400,8 +400,9 @@ def test_cli_train_flags_select_the_provider(monkeypatch):
     seen = {}
 
     class FakeTrainer:
-        def __init__(self, brain_config=None):
+        def __init__(self, brain_config=None, brain_override=False):
             seen["config"] = brain_config
+            seen["override"] = brain_override
 
         async def train(self, url, max_pages=100):
             seen["url"] = url
@@ -415,10 +416,12 @@ def test_cli_train_flags_select_the_provider(monkeypatch):
     cli.cmd_train(args)
     # Switching provider never carries the other provider's model along.
     assert seen["config"] == BrainConfig(provider="codex", reasoning_effort="low")
+    assert seen["override"] is True
 
     args.provider, args.reasoning_effort = None, None
     cli.cmd_train(args)
     assert seen["config"] == BrainConfig(provider="claude", model="claude-opus-4-8")
+    assert seen["override"] is False
 
 
 def _answering(answers, prompts):

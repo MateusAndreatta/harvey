@@ -13,11 +13,19 @@ prompt is sent, and aborted if that fails:
   ``--force``, ``--yolo``, ``--approve-mcps``, or ``--auto-review``.
 - Stdout is ``stream-json``. The first ``tool_call`` event (or any other
   event that asks for a tool) kills the process group. A call that writes
-  outside ``.cursor/`` or rewrites the deny list is discarded too.
+  outside ``.cursor/`` inside the temp workspace, or rewrites the deny
+  list, is discarded too.
+- The process group is killed again after the call returns, including a
+  normal exit. ``cursor-agent`` leaves an ``index.js worker-server`` in
+  that group, still holding ``CURSOR_API_KEY``.
 
-The boundary is that kill, not the permission file. Permissions and ask
-mode are there so a well-behaved CLI never starts a tool; the stream watch
-is what happens when it does.
+The boundary for a tool is that kill, not the permission file. Permissions
+and ask mode are there so a well-behaved CLI never starts a tool; the
+stream watch is what happens when it does. ``workspace_mutation`` only
+walks the temporary workspace. A write anywhere else (the real home, the
+Harvey checkout) is not visible to that check — it is covered only when
+the CLI emits a tool event and the process group is killed. A hook that
+acts before any tool event is outside both checks.
 
 Auth is ``cursor-agent login`` or ``CURSOR_API_KEY``. ``cursor-agent status``
 reports logged out when the only credential is the API key, so a set key is
@@ -344,7 +352,14 @@ def prepare_runtime(root: str) -> tuple[str, str]:
 
 
 def workspace_mutation(workspace: str) -> str:
-    """Why the workspace is no longer the empty deny-all sandbox, or ""."""
+    """Why the temp workspace is no longer an empty deny-all sandbox, or "".
+
+    Only ``workspace`` is walked. Writes outside it — the operator's home,
+    the Harvey checkout, anywhere else — are not detected here. Those rely
+    on the stream watch: the first tool event kills the process group and
+    the answer is discarded. A hook that writes before any tool event is
+    outside this check.
+    """
     cli_path = os.path.join(workspace, ".cursor", "cli.json")
     unexpected = []
     for dirpath, _dirnames, filenames in os.walk(workspace):
@@ -429,17 +444,28 @@ class CursorCallBudget:
 
 
 async def _kill_tree(proc) -> None:
-    if proc is None or proc.returncode is not None:
+    """SIGKILL the whole process group, including after a normal exit.
+
+    ``start_new_session`` makes the leader's pid the group id. A finished
+    ``cursor-agent`` still leaves ``index.js worker-server`` in that group
+    (~150 MB, with ``CURSOR_API_KEY`` in its environment). Killing only
+    while ``returncode is None`` misses it, because the leader has already
+    exited. The group id stays valid until the last member is gone.
+    """
+    if proc is None:
+        return
+    pid = getattr(proc, "pid", None)
+    if not pid:
         return
     try:
-        os.killpg(proc.pid, signal.SIGKILL)
-        return
+        os.killpg(pid, signal.SIGKILL)
     except (ProcessLookupError, PermissionError, OSError, AttributeError):
         pass
-    try:
-        proc.kill()
-    except ProcessLookupError:
-        pass
+    if proc.returncode is None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
 
 
 async def _wait_exit(proc) -> None:
@@ -594,7 +620,7 @@ class CursorClient:
                 kind="setup",
             ) from None
         finally:
-            if proc is not None and proc.returncode is None:
+            if proc is not None:
                 await _kill_tree(proc)
                 await _wait_exit(proc)
             shutil.rmtree(root, ignore_errors=True)
@@ -682,7 +708,7 @@ class CursorClient:
         finally:
             if stderr_task is not None:
                 stderr_task.cancel()
-            if proc is not None and proc.returncode is None:
+            if proc is not None:
                 await _kill_tree(proc)
                 await _wait_exit(proc)
             shutil.rmtree(root, ignore_errors=True)

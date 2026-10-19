@@ -434,7 +434,7 @@ class SetupWizard:
             _print_harvey("and learn everything I can about your product.\n")
 
             from harvey.trainer import Trainer
-            trainer = Trainer(brain_config=self.brain_config)
+            trainer = Trainer(brain_config=self.brain_config, brain_override=True)
             self.config = await trainer.train(url, str(CONFIG_FILE)) or {}
 
             if self.config:

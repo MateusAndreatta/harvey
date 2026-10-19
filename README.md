@@ -477,7 +477,7 @@ usage:
 What to know:
 
 - **It's the provider you configured.** Harvey uses exactly `brain.provider`. A Cursor failure stays a Cursor failure, with a log line of kind setup, auth, usage_limit, timeout, or isolation. A Cursor-only machine doesn't need Claude or Codex installed.
-- **Print mode can use tools, and the CLI has no tools-off flag.** Each prompt runs in an empty temporary workspace (never the Harvey checkout) with a deny-all permission file, `--mode ask`, and `--trust`. The command never includes `--force`, `--yolo`, `--approve-mcps`, or `--auto-review`. Stdout is `stream-json` so a tool request is visible while the process is still running. The first tool event kills the process group and the answer is discarded. A call that writes a file outside `.cursor/` or rewrites the deny list is discarded too.
+- **Print mode can use tools, and the CLI has no tools-off flag.** Each prompt runs in an empty temporary workspace (never the Harvey checkout) with a deny-all permission file, `--mode ask`, and `--trust`. The command never includes `--force`, `--yolo`, `--approve-mcps`, or `--auto-review`. Stdout is `stream-json` so a tool request is visible while the process is still running. The first tool event kills the process group and the answer is discarded. A call that writes a file outside `.cursor/` inside that workspace, or rewrites the deny list, is discarded too. The file check only sees the temporary workspace; a write anywhere else is covered by that same stream kill. After every call, including a normal exit, Harvey kills the whole process group so `cursor-agent`'s `worker-server` does not stay behind with the API key in its environment.
 - **Your Cursor config stays yours for this call.** Harvey sets `CURSOR_CONFIG_DIR` to a private directory that carries the same deny list, so `~/.cursor/cli-config.json` is not the config the process runs under. `HOME` is left alone, so a browser login still works. Hooks in `~/.cursor/hooks.json` and enterprise hooks still load from their own files; the stream kill is what stops a tool those hooks start.
 - **Auth.** `cursor-agent login`, or `CURSOR_API_KEY` in the environment or `.env`. `cursor-agent status` reports unauthenticated when the only credential is that key, so Harvey checks a set key with `cursor-agent models` and reads status only when no key is set. The key stays in the environment and is never placed on the command line.
 - **Models.** Harvey always passes `--model`. A blank `brain.model` means `composer-2.5`. Any other id is passed through as you set it.
@@ -565,7 +565,7 @@ harvey/
 
 skills/                  # ← the sales knowledge. Editable Markdown.
 prompts/                 # ← agent system prompts. Also editable Markdown.
-tests/                   # 574 tests
+tests/                   # 576 tests
 ```
 
 ---

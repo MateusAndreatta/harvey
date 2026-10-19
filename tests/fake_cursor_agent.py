@@ -44,7 +44,51 @@ def _emit(event: dict) -> None:
     print(json.dumps(event), flush=True)
 
 
+def _spawn_orphan() -> None:
+    """Leave a child in this process group after the parent exits.
+
+    Models the real ``cursor-agent`` ``index.js worker-server``, which stays
+    up (and keeps the environment) when the leader exits 0. The child drops
+    the inherited stdio first so the parent's pipes still close.
+    """
+    directory = os.environ.get("HARVEY_FAKE_CURSOR_ORPHAN_DIR", "")
+    if not directory or os.environ.get("HARVEY_FAKE_CURSOR_ORPHAN_CHILD") == "1":
+        return
+    if not hasattr(os, "fork"):
+        return
+    os.makedirs(directory, exist_ok=True)
+    ready_r, ready_w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(ready_r)
+        os.environ["HARVEY_FAKE_CURSOR_ORPHAN_CHILD"] = "1"
+        try:
+            devnull = os.open(os.devnull, os.O_RDWR)
+            os.dup2(devnull, 0)
+            os.dup2(devnull, 1)
+            os.dup2(devnull, 2)
+        except OSError:
+            pass
+        try:
+            path = os.path.join(directory, f"{os.getpid()}.txt")
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(f"{os.getpid()} {os.getpgrp()}\n")
+            os.write(ready_w, b"1")
+        except OSError:
+            pass
+        os.close(ready_w)
+        time.sleep(60)
+        os._exit(0)
+    os.close(ready_w)
+    try:
+        os.read(ready_r, 1)
+    except OSError:
+        pass
+    os.close(ready_r)
+
+
 def main() -> int:
+    _spawn_orphan()
     args = sys.argv[1:]
     key = os.environ.get("CURSOR_API_KEY", "").strip()
 
