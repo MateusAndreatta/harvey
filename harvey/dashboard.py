@@ -8,7 +8,7 @@ import signal
 import subprocess
 import sys
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import aiosqlite
@@ -579,11 +579,17 @@ async def get_stats():
         actions = await query_db("SELECT COUNT(*) as count FROM actions")
         action_count = actions[0]["count"] if actions else 0
 
+        # usage_log.date is the local calendar day from date.today().
+        # SQLite date('now') is UTC, so between 21:00 and midnight in Brazil
+        # it is already tomorrow and the day's calls disappear.
         usage = await query_db(
-            "SELECT claude_calls, codex_calls FROM usage_log WHERE date = date('now')"
+            "SELECT claude_calls, codex_calls, cursor_calls "
+            "FROM usage_log WHERE date = ?",
+            (date.today().isoformat(),),
         )
         usage_today = (usage[0]["claude_calls"] or 0) if usage else 0
         codex_today = (usage[0]["codex_calls"] or 0) if usage else 0
+        cursor_today = (usage[0]["cursor_calls"] or 0) if usage else 0
 
         return {
             "prospects": {"total": prospect_total, "by_status": prospect_map},
@@ -592,6 +598,7 @@ async def get_stats():
             "actions_total": action_count,
             "claude_calls_today": usage_today,
             "codex_calls_today": codex_today,
+            "cursor_calls_today": cursor_today,
             "brain_provider": _active_provider(),
             "brain_status": await _brain_status(),
         }

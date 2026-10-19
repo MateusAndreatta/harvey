@@ -166,7 +166,7 @@ def cmd_train(args):
         print(f"  {e}")
         sys.exit(2)
 
-    trainer = Trainer(brain_config=brain_config)
+    trainer = Trainer(brain_config=brain_config, brain_override=bool(overrides))
     asyncio.run(trainer.train(url, max_pages=args.max_pages))
 
 

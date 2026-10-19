@@ -9,9 +9,8 @@ The points are spread on purpose. A search already filtered by trade, so
 "segment matches" cannot be most of the score or every row lands on 90.
 """
 
-import math
-
-from harvey.brands import brand_key
+from harvey.brands import brand_key, is_reseller_name
+from harvey.places import haversine_km
 from harvey.textutil import fold
 
 # Official Região Metropolitana de Curitiba, and the main municípios of the
@@ -106,15 +105,6 @@ def pick_best_contact(prospects: list) -> object | None:
     return max(prospects, key=key)
 
 
-def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    radius = 6371.0
-    p1, p2 = math.radians(lat1), math.radians(lat2)
-    dphi = math.radians(lat2 - lat1)
-    dlmb = math.radians(lon2 - lon1)
-    a = math.sin(dphi / 2) ** 2 + math.cos(p1) * math.cos(p2) * math.sin(dlmb / 2) ** 2
-    return 2 * radius * math.asin(min(1.0, math.sqrt(a)))
-
-
 def _parse_coordinate(raw: str) -> tuple[float, float, float] | None:
     parts = [p.strip() for p in (raw or "").split(",")]
     if len(parts) < 2:
@@ -169,7 +159,7 @@ def in_target_region(company, config) -> bool:
     if lat is not None and lon is not None and coords:
         for raw in coords.values():
             point = _parse_coordinate(str(raw))
-            if point and _haversine_km(float(lat), float(lon), point[0], point[1]) <= point[2]:
+            if point and haversine_km(float(lat), float(lon), point[0], point[1]) <= point[2]:
                 return True
 
     folded_city = fold(city or where.split(",")[0])
@@ -216,27 +206,46 @@ def score_company(company, config) -> tuple[int, str]:
         or (getattr(company, "domain", "") or "").strip()
     )
     phone = bool((getattr(company, "phone", "") or "").strip())
+    address = bool((getattr(company, "address", "") or "").strip())
     public_email = bool((getattr(company, "public_email", "") or "").strip())
+    name = getattr(company, "name", "") or ""
     producer = kind == "producer"
-    retail = kind == "retail" or (chain and not producer)
+    reseller = kind == "reseller" or is_reseller_name(name)
+    # OSM tags a compounding pharmacy as a shop. The operator already named
+    # that segment, so the tag is not a demotion to generic retail.
+    retail = (kind == "retail" or (chain and not producer)) and not industry_hit
 
-    score = 8
+    # The weights are chosen so the common combinations do not land on the
+    # same number. A producer with nothing else, a producer with a phone,
+    # and a shop with a phone and a site each score differently.
+    score = 15
     if industry_hit:
-        score += 12
+        score += 8
     if geo_hit:
-        score += 18
-    if producer:
-        score += 22
+        score += 8
+    role = ""
+    if reseller:
+        score -= 22
+        role = "reseller"
+    elif producer:
+        score += 20
+        role = "producer"
+    elif industry_hit:
+        score += 14
+        role = "target"
     elif retail:
-        score += 4
+        score -= 6
+        role = "retail"
     if chain:
         score -= 18
     if website:
-        score += 14
+        score += 17
     if phone:
-        score += 8
+        score += 11
+    if address:
+        score += 7
     if public_email:
-        score += 6
+        score += 5
     score = max(1, min(100, score))
 
     if portuguese:
@@ -249,16 +258,22 @@ def score_company(company, config) -> tuple[int, str]:
             parts.append(f"Na região alvo ({where})." if where else "Na região alvo.")
         elif places:
             parts.append("Fora da região alvo.")
-        if producer:
+        if role == "producer":
             parts.append("Produtor, não só ponto de varejo.")
-        elif retail:
+        elif role == "target":
+            parts.append("Segmento alvo, não um varejo genérico.")
+        elif role == "retail":
             parts.append("Varejo.")
+        elif role == "reseller":
+            parts.append("Revenda ou consultor, não o fabricante.")
         if chain:
             parts.append("Rede: filiais contam como uma marca.")
         if website:
             parts.append("Tem site.")
         if phone:
             parts.append("Tem telefone.")
+        if address:
+            parts.append("Tem endereço.")
         if public_email:
             parts.append("Tem e-mail publicado.")
         if not parts:
@@ -273,16 +288,22 @@ def score_company(company, config) -> tuple[int, str]:
             parts.append(f"In the target geography ({where})." if where else "In the target geography.")
         elif places:
             parts.append("Outside the target geography.")
-        if producer:
+        if role == "producer":
             parts.append("Producer, not only a retail counter.")
-        elif retail:
+        elif role == "target":
+            parts.append("Target segment, not a generic retailer.")
+        elif role == "retail":
             parts.append("Retail.")
+        elif role == "reseller":
+            parts.append("Reseller or consultant, not the manufacturer.")
         if chain:
             parts.append("Chain: branches count as one brand.")
         if website:
             parts.append("Has a website.")
         if phone:
             parts.append("Has a phone.")
+        if address:
+            parts.append("Has a street address.")
         if public_email:
             parts.append("Has a published email.")
         if not parts:

@@ -486,8 +486,17 @@ async def _apply_migration(db, script: str):
         await db.executescript("\n".join(kept))
 
 
+# Merge with PR #1 (Cursor brain): change this tuple to
+# ("claude", "codex", "cursor") once harvey/brain.py can run that provider.
+# Adding it here first would make BrainConfig accept "cursor" and then
+# Brain.provider_label would KeyError. cursor_calls is already on the
+# usage summary below so that line does not have to be re-resolved.
 BRAIN_PROVIDERS = ("claude", "codex")
-_USAGE_LOG_COLUMN = {"claude": "claude_calls", "codex": "codex_calls"}
+_USAGE_LOG_COLUMN = {
+    "claude": "claude_calls",
+    "codex": "codex_calls",
+    "cursor": "cursor_calls",
+}
 
 # When a company was last profiled: the newer of the explicit check stamp
 # (set on every attempt, reachable or not) and its latest profile observation
@@ -686,7 +695,7 @@ class StateManager:
                 return self._company_from_row(row) if row else None
 
     _LEAD_COLUMNS = frozenset({
-        "address", "city", "phone", "website", "public_email",
+        "address", "city", "phone", "website", "domain", "public_email",
         "icp_score", "icp_reason", "industry",
         "brand", "latitude", "longitude", "kind",
     })
@@ -1972,11 +1981,13 @@ class StateManager:
             ) as cursor:
                 open_conversations = (await cursor.fetchone())[0]
             async with db.execute(
-                "SELECT claude_calls, codex_calls FROM usage_log WHERE date = ?", (today,)
+                "SELECT claude_calls, codex_calls, cursor_calls FROM usage_log WHERE date = ?",
+                (today,),
             ) as cursor:
                 usage_row = await cursor.fetchone()
                 usage_today = (usage_row[0] or 0) if usage_row else 0
                 codex_today = (usage_row[1] or 0) if usage_row else 0
+                cursor_today = (usage_row[2] or 0) if usage_row else 0
 
         return {
             "prospects": prospect_counts,
@@ -1984,7 +1995,11 @@ class StateManager:
             "active_campaigns": active_campaigns,
             "open_conversations": open_conversations,
             "usage_today": usage_today,  # Claude calls (kept for compatibility)
-            "usage_today_by_provider": {"claude": usage_today, "codex": codex_today},
+            "usage_today_by_provider": {
+                "claude": usage_today,
+                "codex": codex_today,
+                "cursor": cursor_today,
+            },
             # Companies discovered but not yet read. The heartbeat profiles
             # these every cycle — it is free, so it never competes with the
             # Claude budget the rest of the loop is rationing.

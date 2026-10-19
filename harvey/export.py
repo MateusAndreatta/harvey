@@ -131,30 +131,78 @@ async def export_prospects_csv(
     return len(rows), text
 
 
-def _one_per_brand(companies: list) -> tuple[list, dict[str, int], dict[str, list[str]]]:
-    """Keep the strongest row of each chain. Independents stay as they are.
-
-    The returned map is kept-id → how many branches were grouped, so the
-    CSV can say so after the score reason is chosen.
-    """
+def _group_key(company) -> str:
+    """Chain key from the name, even when the stored key is a wikidata id."""
     from harvey.brands import brand_key
 
-    grouped: dict[str, list] = {}
-    order: list[str] = []
-    for company in companies:
-        key = (company.brand or "").strip() or brand_key(company.name) or f"id:{company.id}"
-        if key not in grouped:
-            order.append(key)
-            grouped[key] = []
-        grouped[key].append(company)
+    named = brand_key(company.name)
+    if named.startswith("chain:"):
+        return named
+    stored = (company.brand or "").strip()
+    return stored or named
+
+
+def _same_place(left, right) -> bool:
+    """Same normalized name within half a kilometre."""
+    from harvey.brands import NEARBY_KM, name_key
+    from harvey.places import haversine_km
+
+    key = name_key(left.name)
+    if not key or key != name_key(right.name):
+        return False
+    if None in (left.latitude, left.longitude, right.latitude, right.longitude):
+        return False
+    return haversine_km(
+        left.latitude, left.longitude, right.latitude, right.longitude,
+    ) <= NEARBY_KM
+
+
+def _one_per_brand(companies: list) -> tuple[list, dict[str, int], dict[str, list[str]]]:
+    """Keep the strongest row of each chain, and of each nearby duplicate.
+
+    O Boticário with two brand keys (wikidata and the chain name) is one
+    row. HORSCH do Brasil twice, 200 m apart, is one row. Independents
+    with different names stay separate.
+    """
+    parent = list(range(len(companies)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    def union(a: int, b: int):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    keys = [_group_key(company) for company in companies]
+    for i in range(len(companies)):
+        for j in range(i):
+            if keys[i] and keys[i] == keys[j]:
+                union(i, j)
+            elif _same_place(companies[i], companies[j]):
+                union(i, j)
+
+    grouped: dict[int, list] = {}
+    order: list[int] = []
+    for i, company in enumerate(companies):
+        root = find(i)
+        if root not in grouped:
+            order.append(root)
+            grouped[root] = []
+        grouped[root].append(company)
+
     kept = []
     counts: dict[str, int] = {}
     siblings: dict[str, list[str]] = {}
-    for key in order:
-        rows = grouped[key]
+    for root in order:
+        rows = grouped[root]
         best = max(rows, key=lambda company: (
             1 if (company.website or company.domain) else 0,
             1 if company.phone else 0,
+            1 if company.address else 0,
             int(company.icp_score or 0),
         ))
         kept.append(best)
@@ -172,11 +220,20 @@ def _website(company) -> str:
 
 
 def _city(company) -> str:
+    from harvey.places import nearest_municipality
+    from harvey.textutil import fold
+
     city = (getattr(company, "city", "") or "").strip()
-    if city:
-        return city
-    location = (getattr(company, "location", "") or "").strip()
-    return location.split(",")[0].strip() if location else ""
+    if not city:
+        location = (getattr(company, "location", "") or "").strip()
+        city = location.split(",")[0].strip() if location else ""
+    folded = fold(city)
+    vague = (not city) or ("metropolit" in folded) or folded in {"rmc", "rmsp"}
+    if vague and getattr(company, "latitude", None) is not None and getattr(company, "longitude", None) is not None:
+        hit = nearest_municipality(company.latitude, company.longitude)
+        if hit:
+            return hit[0]
+    return city
 
 
 def _lead_score(company, config):
@@ -202,12 +259,17 @@ async def collect_leads(
     a verified personal mailbox. Chain branches collapse to one row
     unless ``one_per_brand`` is false. Print and label shops are left out.
     """
-    from harvey.brands import is_competitor_name
+    from harvey.brands import drop_thin_lead, is_competitor_name
     from harvey.scoring import pick_best_contact
 
     companies = [
         company for company in await state.list_companies()
-        if not is_competitor_name(company.name) and (company.kind or "") != "competitor"
+        if not is_competitor_name(company.name)
+        and (company.kind or "") != "competitor"
+        and not drop_thin_lead(
+            company.name, company.phone, company.website,
+            company.address, company.domain,
+        )
     ]
     branch_counts: dict[str, int] = {}
     siblings: dict[str, list[str]] = {}

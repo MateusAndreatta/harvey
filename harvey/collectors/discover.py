@@ -30,8 +30,12 @@ from urllib.parse import urlparse
 
 import httpx
 
-from harvey.brands import brand_key, is_competitor_name
+from harvey.brands import (
+    NEARBY_KM,     brand_key, drop_thin_lead, is_competitor_name,
+    is_manufacturer_name, is_reseller_name, name_key,
+)
 from harvey.models import Company
+from harvey.places import bounding_box, haversine_km, nearest_municipality
 from harvey.textutil import fold
 
 logger = logging.getLogger("harvey.collectors.discover")
@@ -114,6 +118,7 @@ def is_junk(domain: str, name: str = "") -> bool:
 # the settings table: a given city is looked up once, ever.
 
 NOMINATIM = "https://nominatim.openstreetmap.org/search"
+NOMINATIM_REVERSE = "https://nominatim.openstreetmap.org/reverse"
 GEOCODE_UA = "Harvey/0.1 (open-source sales agent; github.com/ethanplusai/harvey)"
 
 
@@ -497,6 +502,11 @@ class OpenStreetMap(DiscoveryProvider):
     # Overpass etiquette for a shipped tool: modest volume, no parallelism.
     MIN_INTERVAL = 2.0
     BACKOFF = 5.0
+    # 25s made a 40 km query return HTTP 200 with
+    # remark "runtime error: Query timed out" and zero elements. 90s completes.
+    # The HTTP client read timeout has to be longer than this.
+    QUERY_TIMEOUT_S = 90
+    READ_TIMEOUT = httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=10.0)
 
     # A friendly term maps to the OSM tags that actually carry those businesses.
     # Keys are accent-folded stems. One industry may match several stems
@@ -515,7 +525,7 @@ class OpenStreetMap(DiscoveryProvider):
     _RETAIL_IF_PRODUCER = frozenset({
         "shop=butcher", "shop=greengrocer", "shop=deli", "shop=dairy",
         "shop=seafood", "shop=farm", "shop=supermarket", "shop=convenience",
-        "shop=wholesale", "shop=clothes", "shop=cosmetics", "shop=perfumery",
+        "shop=wholesale", "shop=clothes",
         "shop=chemist", "shop=pharmacy",
     })
     TAG_MAP = {
@@ -557,9 +567,24 @@ class OpenStreetMap(DiscoveryProvider):
         ],
         "bebida": ["craft=brewery", "craft=winery", "craft=distillery"],
         "beverage": ["craft=brewery", "craft=winery", "craft=distillery"],
-        # Cosmetics, clothing, pharmacy. "cosmet" is after "dentist" above.
-        "cosmet": ["shop=cosmetics", "shop=perfumery"],
+        # Cosmetics shops and the factories. Name filters keep industrial
+        # and office hits on cosmetics instead of every works in the city.
+        # Shops stay in the set: a cosmetics counter is still a lead, and
+        # scoring (not the query) is what ranks the manufacturer higher.
+        "cosmet": [
+            "industrial=factory|name~cosmet",
+            "man_made=works|name~cosmet",
+            "office=company|name~cosmet",
+            "craft=cosmetics",
+            "shop=cosmetics",
+            "shop=perfumery",
+        ],
         "perfum": ["shop=cosmetics", "shop=perfumery"],
+        "higien": [
+            "industrial=factory|name~higien",
+            "man_made=works|name~higien",
+            "office=company|name~higien",
+        ],
         # Manufacturers, not the C&A. A search that only says "clothes" or
         # "roupa" still uses the retail tag below.
         "confecc": ["craft=tailor", "craft=dressmaker"],
@@ -667,46 +692,67 @@ class OpenStreetMap(DiscoveryProvider):
                 f"search mapped trades ({', '.join(self.SUPPORTED_TERMS)}). Use a "
                 f"listings or SERP provider for anything else.")
         lat, lng, radius_km = (query.coordinate.split(",") + ["", "", ""])[:3]
+        try:
+            center_lat = float(lat)
+            center_lng = float(lng)
+        except ValueError:
+            logger.warning("osm: bad coordinate %r", query.coordinate)
+            return []
         radius_m = int(float(radius_km or 25) * 1000)
-        # One nwr (node/way/relation) per tag, and only elements that have a
-        # name. The old query asked for node and way separately and then
-        # threw away the unnamed ones, which is most of the time Overpass spent.
+        south, west, north, east = bounding_box(center_lat, center_lng, radius_m)
+        # One nwr per tag, named elements only, inside the bbox. ``around:``
+        # on a 40 km radius was the slow query (about 80s). The bbox is the
+        # same search in well under that; distance filtering drops the corners.
         clauses = "".join(
-            self._overpass_clause(tag, radius_m, lat, lng) for tag in tags
+            self._overpass_clause(tag, south, west, north, east) for tag in tags
         )
-        body = f"[out:json][timeout:25];({clauses});out center {query.limit};"
+        body = (
+            f"[out:json][timeout:{self.QUERY_TIMEOUT_S}];"
+            f"({clauses});out center {query.limit};"
+        )
         started = time.monotonic()
 
-        # Overpass is a free volunteer service and 429s/504s readily under
-        # load. Walk the mirrors, then RAISE: returning [] would make a
-        # throttled run look exactly like a market with no businesses in it.
+        # A timeout comes back as HTTP 200 with a remark and zero elements.
+        # Treating that as an empty market drops the whole city. 5xx and that
+        # remark move on to the next mirror. Still raise if every mirror fails.
         headers = {"User-Agent": "Harvey/0.1 (open-source sales agent; "
                                  "github.com/ethanplusai/harvey)"}
-        r = None
+        payload = None
+        last_error = "no response"
         for i, endpoint in enumerate(self.ENDPOINTS):
             if i:
                 await asyncio.sleep(self.BACKOFF)
             try:
-                r = await client.post(endpoint, content=body.encode(),
-                                      headers=headers)
+                r = await client.post(
+                    endpoint, content=body.encode(), headers=headers,
+                    timeout=self.READ_TIMEOUT,
+                )
             except httpx.HTTPError as e:
+                last_error = str(e)
                 logger.warning("osm: %s unreachable (%s)", endpoint, e)
                 continue
-            if r.status_code not in (429, 504):
-                break
-            logger.warning("osm: %s is throttling (%s) — trying the next mirror",
-                           endpoint, r.status_code)
+            failure = self._overpass_failure(r)
+            if failure:
+                last_error = failure
+                logger.warning(
+                    "osm: %s failed (%s) — trying the next mirror", endpoint, failure,
+                )
+                continue
+            if r.status_code >= 400:
+                r.raise_for_status()
+            payload = r.json()
+            break
         else:
             raise RuntimeError(
-                "Every public Overpass mirror is throttling right now. This is "
-                "free volunteer infrastructure — wait a few minutes and re-run, "
-                "or use a paid provider for bulk work.")
-        if r is None:
-            raise RuntimeError("Could not reach any Overpass mirror.")
-        r.raise_for_status()
+                "Every public Overpass mirror is throttling or timing out "
+                f"({last_error}). A timed-out query is not an empty market. "
+                "Wait a few minutes and re-run, or use a paid provider for bulk work."
+            )
+        if payload is None:
+            raise RuntimeError(f"Could not reach any Overpass mirror ({last_error}).")
 
         out = []
-        for el in r.json().get("elements") or []:
+        for el in payload.get("elements") or []:
             tags = el.get("tags") or {}
             name = tags.get("name") or ""
             if not name:
@@ -718,21 +764,34 @@ class OpenStreetMap(DiscoveryProvider):
                 plon = float(el.get("lon") or center.get("lon"))
             except (TypeError, ValueError):
                 plat, plon = None, None
+            # A point we can locate has to sit inside the circle. The bbox is
+            # a square, so its corners are outside the radius. An element
+            # with no coordinates is kept: ``around:`` used to imply it was
+            # already inside, and some nodes only carry a center on `out center`.
+            if plat is not None and not self._within_radius(
+                plat, plon, center_lat, center_lng, radius_m,
+            ):
+                continue
             site = tags.get("website") or tags.get("contact:website") or ""
-            city_name = tags.get("addr:city") or ""
-            state_name = tags.get("addr:state") or ""
-            city = ", ".join(x for x in (city_name, state_name) if x)
             street = " ".join(x for x in (
                 tags.get("addr:housenumber"), tags.get("addr:street"),
                 tags.get("addr:suburb"),
             ) if x)
+            # Leave location blank when we cannot name the municipality.
+            # _upsert then tries a cached reverse geocode, and only then the
+            # search label. Never store "Curitiba e região metropolitana" as
+            # the city when the point itself can name the town.
+            location = self.place_label(
+                tags.get("addr:city") or "", tags.get("addr:state") or "",
+                plat, plon,
+            )
             out.append(Business(
                 name=name,
                 domain=normalize_domain(site),
                 website=site,
                 phone=tags.get("phone") or tags.get("contact:phone") or "",
                 address=street,
-                location=city or query.location,
+                location=location,
                 category=query.term or tags.get("craft") or tags.get("shop")
                 or tags.get("office") or "",
                 has_website=bool(site),
@@ -753,7 +812,29 @@ class OpenStreetMap(DiscoveryProvider):
         return out
 
     @staticmethod
-    def _overpass_clause(spec: str, radius_m: int, lat: str, lng: str) -> str:
+    def _overpass_failure(response) -> str:
+        """Why this mirror's answer cannot be used, or "" when it can.
+
+        HTTP 200 plus ``remark: runtime error: Query timed out`` is a failure
+        with an empty element list. 5xx and 429 are failures too.
+        """
+        if response.status_code >= 500 or response.status_code in (408, 429):
+            return f"HTTP {response.status_code}"
+        if response.status_code != 200:
+            return ""
+        try:
+            payload = response.json()
+        except Exception:
+            return "response was not JSON"
+        remark = str(payload.get("remark") or "")
+        lowered = remark.lower()
+        if "timed out" in lowered or "runtime error" in lowered:
+            return remark
+        return ""
+
+    @staticmethod
+    def _overpass_clause(spec: str, south: float, west: float,
+                         north: float, east: float) -> str:
         body, _, name_rx = spec.partition("|name~")
         key, _, value = body.partition("=")
         # A name regex already requires a name. Otherwise ask Overpass to
@@ -761,8 +842,28 @@ class OpenStreetMap(DiscoveryProvider):
         name_filter = f'["name"~"{name_rx}",i]' if name_rx else '["name"]'
         return (
             f'nwr["{key}"="{value}"]{name_filter}'
-            f"(around:{radius_m},{lat},{lng});"
+            f"({south:.5f},{west:.5f},{north:.5f},{east:.5f});"
         )
+
+    @staticmethod
+    def _within_radius(lat: float, lon: float, center_lat: float,
+                       center_lng: float, radius_m: int) -> bool:
+        return haversine_km(lat, lon, center_lat, center_lng) * 1000 <= radius_m
+
+    @staticmethod
+    def place_label(addr_city: str, addr_state: str, lat, lon) -> str:
+        """Municipality label. addr:city wins; otherwise the nearest town."""
+        city = (addr_city or "").strip()
+        state = (addr_state or "").strip()
+        if city:
+            return ", ".join(part for part in (city, state) if part)
+        if lat is None or lon is None:
+            return ""
+        hit = nearest_municipality(float(lat), float(lon))
+        if not hit:
+            return ""
+        name, uf = hit
+        return f"{name}, {state or uf}"
 
     @staticmethod
     def _kind(tags: dict, name: str) -> str:
@@ -770,8 +871,14 @@ class OpenStreetMap(DiscoveryProvider):
             return "competitor"
         if tags.get("shop") in ("copyshop", "printer"):
             return "competitor"
-        if tags.get("craft") or tags.get("industrial") or tags.get("man_made") in (
-            "works", "factory",
+        made = is_manufacturer_name(name)
+        if is_reseller_name(name) and not made:
+            return "reseller"
+        if (
+            tags.get("craft")
+            or tags.get("industrial")
+            or tags.get("man_made") in ("works", "factory")
+            or made
         ):
             return "producer"
         if tags.get("shop") or tags.get("amenity"):
@@ -965,7 +1072,13 @@ async def run_discovery(
                 report.found += len(found)
                 batch = []
                 for biz in found:
-                    if is_junk(biz.domain, biz.name) or biz.kind == "competitor":
+                    if (
+                        is_junk(biz.domain, biz.name)
+                        or biz.kind == "competitor"
+                        or drop_thin_lead(
+                            biz.name, biz.phone, biz.website, biz.address, biz.domain,
+                        )
+                    ):
                         report.junk += 1
                         continue
                     # One row per chain. The brand key is stable across
@@ -1001,21 +1114,101 @@ async def run_discovery(
     return report
 
 
+def _metro_label(value: str) -> bool:
+    """True when the text is the search area, not a municipality."""
+    folded = fold(value)
+    return "metropolit" in folded or folded in {"rmc", "rmsp"}
+
+
+async def _company_with_chain(state, chain: str):
+    """A row already stored under this chain, even if its brand key is wikidata."""
+    for company in await state.list_companies():
+        if company.brand == chain or brand_key(company.name) == chain:
+            return company
+    return None
+
+
+async def _nearby_same_name(state, biz: Business):
+    """Same normalized name within NEARBY_KM. HORSCH twice, 200 m apart."""
+    key = name_key(biz.name)
+    if not key or biz.latitude is None or biz.longitude is None:
+        return None
+    for company in await state.list_companies():
+        if name_key(company.name) != key:
+            continue
+        if company.latitude is None or company.longitude is None:
+            continue
+        dist = haversine_km(
+            biz.latitude, biz.longitude, company.latitude, company.longitude,
+        )
+        if dist <= NEARBY_KM:
+            return company
+    return None
+
+
+async def _reverse_municipality(state, lat: float, lon: float) -> str:
+    """Cached Nominatim reverse geocode. '' when it misses. One cell per ~100 m."""
+    cache_key = f"revgeo:{lat:.3f},{lon:.3f}"
+    cached = await state.get_setting(cache_key)
+    if cached:
+        if cached == "-":
+            return ""
+        city, _, uf = cached.partition("|")
+        return ", ".join(part for part in (city, uf) if part)
+
+    try:
+        async with httpx.AsyncClient(timeout=TIMEOUT) as client:
+            r = await client.get(
+                NOMINATIM_REVERSE,
+                params={
+                    "lat": f"{lat:.5f}", "lon": f"{lon:.5f}",
+                    "format": "json", "zoom": 10, "addressdetails": 1,
+                },
+                headers={"User-Agent": GEOCODE_UA},
+            )
+            r.raise_for_status()
+            payload = r.json()
+    except Exception as e:
+        logger.warning("reverse geocode failed at %.3f,%.3f: %s", lat, lon, e)
+        return ""
+
+    address = payload.get("address") or {}
+    city = (
+        address.get("city") or address.get("town") or address.get("municipality")
+        or address.get("village") or ""
+    )
+    uf = address.get("state") or ""
+    # Nominatim state is often the full name. Keep a short suffix when we can.
+    if not city:
+        await state.set_setting(cache_key, "-")
+        return ""
+    await state.set_setting(cache_key, f"{city}|{uf}")
+    return ", ".join(part for part in (city, uf) if part)
+
+
 async def _upsert(state, biz: Business, query: DiscoveryQuery) -> tuple[str, bool]:
     """Record the business, returning (id, was_new)."""
     # Look before inserting, so "already knew this one" is a fact we report
     # rather than something inferred from an insert's return value.
+    if not biz.location and biz.latitude is not None and biz.longitude is not None:
+        biz.location = await _reverse_municipality(state, biz.latitude, biz.longitude)
     existing = None
     if biz.brand:
         existing = await state.get_company_by_brand(biz.brand)
+    if existing is None and biz.brand.startswith("chain:"):
+        existing = await _company_with_chain(state, biz.brand)
     if existing is None and biz.domain:
         existing = await state.get_company_by_domain(biz.domain)
     if existing is None and biz.external_id:
         existing = await state.get_company_by_external_id(biz.external_id)
+    if existing is None:
+        existing = await _nearby_same_name(state, biz)
     if existing:
         fill = {}
         if biz.website and not existing.website:
             fill["website"] = biz.website
+        if biz.domain and not existing.domain:
+            fill["domain"] = biz.domain
         if biz.phone and not existing.phone:
             fill["phone"] = biz.phone
         if biz.kind and not existing.kind:
@@ -1023,6 +1216,13 @@ async def _upsert(state, biz: Business, query: DiscoveryQuery) -> tuple[str, boo
         if biz.latitude is not None and existing.latitude is None:
             fill["latitude"] = biz.latitude
             fill["longitude"] = biz.longitude
+        if biz.brand.startswith("chain:") and (existing.brand or "").startswith("wd:"):
+            fill["brand"] = biz.brand
+        new_city = (biz.location or "").split(",")[0].strip()
+        if new_city and not _metro_label(new_city) and (
+            not existing.city or _metro_label(existing.city)
+        ):
+            fill["city"] = new_city
         if fill:
             await state.update_company_lead(existing.id, **fill)
         return existing.id, False
